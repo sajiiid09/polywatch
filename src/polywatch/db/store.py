@@ -38,6 +38,14 @@ def init_db(con: sqlite3.Connection) -> None:
     for col, decl in (("selected", "INTEGER"), ("screen_reason", "TEXT"), ("profile_json", "TEXT")):
         if col not in have:
             con.execute(f"ALTER TABLE wallets ADD COLUMN {col} {decl}")
+    # ...and for databases created before the trading side needed gamma's market id and the
+    # per-market execution constraints. CREATE TABLE IF NOT EXISTS will not add columns to a
+    # table that already exists, so these have to be spelled out.
+    have = {r["name"] for r in con.execute("PRAGMA table_info(markets)")}
+    for col, decl in (("gamma_id", "TEXT"), ("tick_size", "REAL"), ("order_min_size", "REAL"),
+                      ("accepting_orders", "INTEGER"), ("enable_order_book", "INTEGER")):
+        if col not in have:
+            con.execute(f"ALTER TABLE markets ADD COLUMN {col} {decl}")
     con.commit()
 
 
@@ -105,15 +113,18 @@ def upsert_markets(con: sqlite3.Connection, rows: Sequence[dict]) -> int:
     for r in rows:
         r.setdefault("fetched_at", now)
     con.executemany(
-        """INSERT INTO markets (condition_id, question, slug, category, closed, active, archived,
-                start_ts, end_ts, outcomes_json, prices_json, uma_status_json, resolved,
-                winning_index, neg_risk, fees_enabled, fee_type, fee_rate, fee_exponent,
-                fee_taker_only, fee_rebate_rate, fee_source, fetched_at)
-           VALUES (:condition_id,:question,:slug,:category,:closed,:active,:archived,:start_ts,
-                :end_ts,:outcomes_json,:prices_json,:uma_status_json,:resolved,:winning_index,
-                :neg_risk,:fees_enabled,:fee_type,:fee_rate,:fee_exponent,:fee_taker_only,
-                :fee_rebate_rate,:fee_source,:fetched_at)
+        """INSERT INTO markets (condition_id, gamma_id, question, slug, category, closed,
+                active, archived, start_ts, end_ts, outcomes_json, prices_json, uma_status_json,
+                resolved, winning_index, neg_risk, fees_enabled, fee_type, fee_rate, fee_exponent,
+                fee_taker_only, fee_rebate_rate, fee_source, tick_size, order_min_size,
+                accepting_orders, enable_order_book, fetched_at)
+           VALUES (:condition_id,:gamma_id,:question,:slug,:category,:closed,:active,:archived,
+                :start_ts,:end_ts,:outcomes_json,:prices_json,:uma_status_json,:resolved,
+                :winning_index,:neg_risk,:fees_enabled,:fee_type,:fee_rate,:fee_exponent,
+                :fee_taker_only,:fee_rebate_rate,:fee_source,:tick_size,:order_min_size,
+                :accepting_orders,:enable_order_book,:fetched_at)
            ON CONFLICT(condition_id) DO UPDATE SET
+                gamma_id=excluded.gamma_id,
                 question=excluded.question, slug=excluded.slug, category=excluded.category,
                 closed=excluded.closed, active=excluded.active, archived=excluded.archived,
                 start_ts=excluded.start_ts, end_ts=excluded.end_ts,
@@ -123,7 +134,11 @@ def upsert_markets(con: sqlite3.Connection, rows: Sequence[dict]) -> int:
                 fees_enabled=excluded.fees_enabled, fee_type=excluded.fee_type,
                 fee_rate=excluded.fee_rate, fee_exponent=excluded.fee_exponent,
                 fee_taker_only=excluded.fee_taker_only, fee_rebate_rate=excluded.fee_rebate_rate,
-                fee_source=excluded.fee_source, fetched_at=excluded.fetched_at""",
+                fee_source=excluded.fee_source, tick_size=excluded.tick_size,
+                order_min_size=excluded.order_min_size,
+                accepting_orders=excluded.accepting_orders,
+                enable_order_book=excluded.enable_order_book,
+                fetched_at=excluded.fetched_at""",
         rows,
     )
     con.commit()
@@ -250,3 +265,308 @@ def counts(con: sqlite3.Connection) -> dict[str, int]:
         "fetches": q("SELECT COUNT(*) FROM ingest_log"),
         "fetch_errors": q("SELECT COUNT(*) FROM ingest_log WHERE error IS NOT NULL"),
     }
+
+
+# --- copy trading ---------------------------------------------------------
+# The invariant these functions exist to protect: a finished run must be explicable from this
+# database alone. Every observed action of the target lands in `signals` whether or not we
+# copied it, and a skip always carries the reason it was skipped.
+
+TASK_COLUMNS = ("name", "trader", "mode", "bankroll", "buy_method", "fixed_usd",
+                "max_market_usd", "max_concurrent", "slippage", "sl_kind", "sl_value",
+                "tp_kind", "tp_value", "behavior", "risk", "category", "style", "hold",
+                "activity", "created_at", "updated_at", "config_json")
+
+
+def upsert_task(con: sqlite3.Connection, row: dict) -> None:
+    now = int(time.time())
+    row.setdefault("created_at", now)
+    row["updated_at"] = now
+    cols = ",".join(TASK_COLUMNS)
+    binds = ",".join(f":{c}" for c in TASK_COLUMNS)
+    sets = ",".join(f"{c}=excluded.{c}" for c in TASK_COLUMNS if c not in ("name", "created_at"))
+    con.execute(f"INSERT INTO tasks ({cols}) VALUES ({binds}) "
+                f"ON CONFLICT(name) DO UPDATE SET {sets}", row)
+    con.commit()
+
+
+def get_task(con: sqlite3.Connection, name: str) -> sqlite3.Row | None:
+    return con.execute("SELECT * FROM tasks WHERE name=?", (name,)).fetchone()
+
+
+def list_tasks(con: sqlite3.Connection) -> list[sqlite3.Row]:
+    return con.execute("SELECT * FROM tasks ORDER BY updated_at DESC").fetchall()
+
+
+def delete_task(con: sqlite3.Connection, name: str) -> int:
+    n = con.execute("DELETE FROM tasks WHERE name=?", (name,)).rowcount
+    con.commit()
+    return n
+
+
+def start_run(con: sqlite3.Connection, task: str, mode: str, bankroll: float) -> int:
+    cur = con.execute(
+        "INSERT INTO task_runs (task, mode, started_at, start_bankroll) VALUES (?,?,?,?)",
+        (task, mode, int(time.time()), bankroll),
+    )
+    con.commit()
+    return int(cur.lastrowid)
+
+
+def finish_run(con: sqlite3.Connection, run_id: int, end_bankroll: float, reason: str) -> None:
+    con.execute(
+        "UPDATE task_runs SET stopped_at=?, end_bankroll=?, stop_reason=? WHERE id=?",
+        (int(time.time()), end_bankroll, reason, run_id),
+    )
+    con.commit()
+
+
+def running_runs(con: sqlite3.Connection, task: str | None = None) -> list[sqlite3.Row]:
+    """Runs that were never closed out. A leftover row here means a previous run was killed
+    rather than stopped, and its open positions are stale -- the engine must not silently
+    inherit them."""
+    sql = "SELECT * FROM task_runs WHERE stopped_at IS NULL"
+    args: tuple = ()
+    if task is not None:
+        sql += " AND task=?"
+        args = (task,)
+    return con.execute(sql + " ORDER BY started_at", args).fetchall()
+
+
+def last_run(con: sqlite3.Connection, task: str) -> sqlite3.Row | None:
+    return con.execute(
+        "SELECT * FROM task_runs WHERE task=? ORDER BY started_at DESC LIMIT 1", (task,)
+    ).fetchone()
+
+
+def insert_signal(con: sqlite3.Connection, row: dict) -> int | None:
+    """Record one observed action of the target. Returns the new id, or None if we had already
+    seen it.
+
+    Dedupe is a UNIQUE constraint rather than an in-memory set on purpose: consecutive polls
+    always overlap, and a set would be lost on restart -- which is precisely when copying a
+    stale trade would be most expensive.
+    """
+    row.setdefault("seen_ts", int(time.time()))
+    cur = con.execute(
+        """INSERT OR IGNORE INTO signals
+               (run_id, trader, kind, tx_hash, token_id, condition_id, side, size, price,
+                usdc_size, trader_ts, seen_ts, action, reason)
+           VALUES (:run_id,:trader,:kind,:tx_hash,:token_id,:condition_id,:side,:size,:price,
+                :usdc_size,:trader_ts,:seen_ts,:action,:reason)""",
+        row,
+    )
+    con.commit()
+    return int(cur.lastrowid) if cur.rowcount else None
+
+
+def signal_seen(con: sqlite3.Connection, run_id: int, tx_hash: str, token_id: str,
+                side: str | None, size: float | None) -> bool:
+    return con.execute(
+        """SELECT 1 FROM signals
+           WHERE run_id=? AND tx_hash=? AND token_id=? AND side IS ? AND size IS ?""",
+        (run_id, tx_hash, token_id, side, size),
+    ).fetchone() is not None
+
+
+def signals(con: sqlite3.Connection, run_id: int, action: str | None = None
+            ) -> list[sqlite3.Row]:
+    sql = "SELECT * FROM signals WHERE run_id=?"
+    args: tuple = (run_id,)
+    if action is not None:
+        sql += " AND action=?"
+        args += (action,)
+    return con.execute(sql + " ORDER BY seen_ts, id", args).fetchall()
+
+
+def skip_reasons(con: sqlite3.Connection, run_id: int) -> list[tuple[str, int]]:
+    """Why we passed on trades, most common first. The main output of a paper run."""
+    return [(r[0], r[1]) for r in con.execute(
+        """SELECT reason, COUNT(*) FROM signals
+           WHERE run_id=? AND action='skipped' GROUP BY reason ORDER BY COUNT(*) DESC""",
+        (run_id,),
+    )]
+
+
+def insert_order(con: sqlite3.Connection, row: dict) -> int:
+    row.setdefault("ts", int(time.time()))
+    cur = con.execute(
+        """INSERT INTO orders
+               (run_id, signal_id, mode, token_id, condition_id, side, intent_usd, limit_price,
+                book_vwap, filled_shares, avg_price, fee, status, reason, ts)
+           VALUES (:run_id,:signal_id,:mode,:token_id,:condition_id,:side,:intent_usd,
+                :limit_price,:book_vwap,:filled_shares,:avg_price,:fee,:status,:reason,:ts)""",
+        row,
+    )
+    con.commit()
+    return int(cur.lastrowid)
+
+
+def orders(con: sqlite3.Connection, run_id: int) -> list[sqlite3.Row]:
+    return con.execute("SELECT * FROM orders WHERE run_id=? ORDER BY ts, id",
+                       (run_id,)).fetchall()
+
+
+def open_position(con: sqlite3.Connection, row: dict) -> int:
+    row.setdefault("opened_ts", int(time.time()))
+    cur = con.execute(
+        """INSERT INTO positions
+               (run_id, token_id, condition_id, shares, avg_price, cost_usd, fees_paid,
+                opened_ts, open)
+           VALUES (:run_id,:token_id,:condition_id,:shares,:avg_price,:cost_usd,:fees_paid,
+                :opened_ts,1)""",
+        row,
+    )
+    con.commit()
+    return int(cur.lastrowid)
+
+
+def add_to_position(con: sqlite3.Connection, position_id: int, shares: float, cost_usd: float,
+                    fee: float) -> None:
+    """Fold a second fill into an open position, recomputing the weighted average price.
+
+    avg_price has to move with the new cost or the stop-loss would keep measuring against the
+    first entry only, which is how a position quietly ends up with no working stop.
+    """
+    con.execute(
+        """UPDATE positions
+           SET shares = shares + ?,
+               cost_usd = cost_usd + ?,
+               fees_paid = fees_paid + ?,
+               avg_price = (cost_usd + ?) / NULLIF(shares + ?, 0)
+           WHERE id=?""",
+        (shares, cost_usd, fee, cost_usd, shares, position_id),
+    )
+    con.commit()
+
+
+def close_position(con: sqlite3.Connection, position_id: int, proceeds_usd: float,
+                   exit_fee: float, reason: str) -> float:
+    """Settle a position and return its realized PnL.
+
+    PnL is proceeds minus entry cost minus every fee on both sides. Fees are subtracted here
+    rather than folded into cost_usd so that `report` can show what the taker fee actually
+    cost over a run -- the number this whole exercise exists to measure.
+    """
+    row = con.execute("SELECT cost_usd, fees_paid FROM positions WHERE id=?",
+                      (position_id,)).fetchone()
+    if row is None:
+        raise KeyError(f"no position {position_id}")
+    pnl = proceeds_usd - row["cost_usd"] - row["fees_paid"] - exit_fee
+    con.execute(
+        """UPDATE positions
+           SET open=0, closed_ts=?, close_reason=?, realized_pnl=?, fees_paid=fees_paid+?
+           WHERE id=?""",
+        (int(time.time()), reason, pnl, exit_fee, position_id),
+    )
+    con.commit()
+    return pnl
+
+
+def open_positions(con: sqlite3.Connection, run_id: int) -> list[sqlite3.Row]:
+    return con.execute(
+        "SELECT * FROM positions WHERE run_id=? AND open=1 ORDER BY opened_ts", (run_id,)
+    ).fetchall()
+
+
+def open_position_for(con: sqlite3.Connection, run_id: int, token_id: str) -> sqlite3.Row | None:
+    return con.execute(
+        "SELECT * FROM positions WHERE run_id=? AND token_id=? AND open=1", (run_id, token_id)
+    ).fetchone()
+
+
+def market_exposure(con: sqlite3.Connection, run_id: int, condition_id: str) -> float:
+    """Open cost across every outcome of one market -- what the per-market cap is measured on.
+
+    Keyed on condition_id, not token_id: holding YES and NO of the same market is two positions
+    but one market's worth of risk.
+    """
+    row = con.execute(
+        """SELECT COALESCE(SUM(cost_usd + fees_paid), 0) FROM positions
+           WHERE run_id=? AND condition_id=? AND open=1""",
+        (run_id, condition_id),
+    ).fetchone()
+    return float(row[0])
+
+
+def run_cash(con: sqlite3.Connection, run_id: int) -> float:
+    """Uninvested cash: the starting bankroll, minus what open positions tie up, plus what
+    closed ones returned."""
+    start = con.execute("SELECT start_bankroll FROM task_runs WHERE id=?",
+                        (run_id,)).fetchone()
+    if start is None:
+        raise KeyError(f"no run {run_id}")
+    tied = con.execute(
+        """SELECT COALESCE(SUM(cost_usd + fees_paid), 0) FROM positions
+           WHERE run_id=? AND open=1""", (run_id,)).fetchone()[0]
+    # Only the PnL, not cost + PnL. `tied` counts open positions only, so a closed position's
+    # cost was never subtracted here to begin with -- adding it back would credit the account
+    # with money it never spent.
+    realized = con.execute(
+        """SELECT COALESCE(SUM(realized_pnl), 0) FROM positions
+           WHERE run_id=? AND open=0""", (run_id,)).fetchone()[0]
+    return float(start[0]) - float(tied) + float(realized)
+
+
+def run_summary(con: sqlite3.Connection, run_id: int) -> dict:
+    q = lambda sql: con.execute(sql, (run_id,)).fetchone()[0]  # noqa: E731
+    return {
+        "signals_seen": q("SELECT COUNT(*) FROM signals WHERE run_id=?"),
+        "copied": q("SELECT COUNT(*) FROM signals WHERE run_id=? AND action='copied'"),
+        "skipped": q("SELECT COUNT(*) FROM signals WHERE run_id=? AND action='skipped'"),
+        "orders": q("SELECT COUNT(*) FROM orders WHERE run_id=?"),
+        "positions_open": q("SELECT COUNT(*) FROM positions WHERE run_id=? AND open=1"),
+        "positions_closed": q("SELECT COUNT(*) FROM positions WHERE run_id=? AND open=0"),
+        "fees_paid": q("SELECT COALESCE(SUM(fees_paid),0) FROM positions WHERE run_id=?"),
+        "realized_pnl": q(
+            "SELECT COALESCE(SUM(realized_pnl),0) FROM positions WHERE run_id=? AND open=0"),
+        "cash": run_cash(con, run_id),
+    }
+
+
+TRADER_SCORE_COLUMNS = ("address", "scanned_at", "n_closed", "win_rate", "roi", "realized_pnl",
+                        "brier", "avg_entry_price", "avg_stake_usd", "max_drawdown",
+                        "consistency", "est_account_usd", "top_category", "persona_fit",
+                        "rank_score", "metrics_json")
+
+
+def upsert_trader_score(con: sqlite3.Connection, row: dict) -> None:
+    row.setdefault("scanned_at", int(time.time()))
+    cols = ",".join(TRADER_SCORE_COLUMNS)
+    binds = ",".join(f":{c}" for c in TRADER_SCORE_COLUMNS)
+    sets = ",".join(f"{c}=excluded.{c}" for c in TRADER_SCORE_COLUMNS if c != "address")
+    con.execute(f"INSERT INTO trader_scores ({cols}) VALUES ({binds}) "
+                f"ON CONFLICT(address) DO UPDATE SET {sets}", row)
+    con.commit()
+
+
+def get_trader_score(con: sqlite3.Connection, address: str) -> sqlite3.Row | None:
+    return con.execute("SELECT * FROM trader_scores WHERE address=?",
+                       (address.lower(),)).fetchone()
+
+
+def top_trader_scores(con: sqlite3.Connection, limit: int = 30) -> list[sqlite3.Row]:
+    return con.execute(
+        "SELECT * FROM trader_scores WHERE rank_score IS NOT NULL "
+        "ORDER BY rank_score DESC LIMIT ?", (limit,)
+    ).fetchall()
+
+
+MARKET_META_COLUMNS = ("condition_id", "tick_size", "min_order_size", "accepting_orders",
+                       "enable_order_book", "neg_risk", "category_derived", "fee_rate",
+                       "end_ts", "fetched_at")
+
+
+def upsert_market_meta(con: sqlite3.Connection, row: dict) -> None:
+    row.setdefault("fetched_at", int(time.time()))
+    cols = ",".join(MARKET_META_COLUMNS)
+    binds = ",".join(f":{c}" for c in MARKET_META_COLUMNS)
+    sets = ",".join(f"{c}=excluded.{c}" for c in MARKET_META_COLUMNS if c != "condition_id")
+    con.execute(f"INSERT INTO market_meta ({cols}) VALUES ({binds}) "
+                f"ON CONFLICT(condition_id) DO UPDATE SET {sets}", row)
+    con.commit()
+
+
+def get_market_meta(con: sqlite3.Connection, condition_id: str) -> sqlite3.Row | None:
+    return con.execute("SELECT * FROM market_meta WHERE condition_id=?",
+                       (condition_id,)).fetchone()

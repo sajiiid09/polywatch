@@ -14,7 +14,12 @@ DATA_API = "https://data-api.polymarket.com"
 CLOB = "https://clob.polymarket.com"
 
 # Verified 2026-09-05 by probing: /leaderboard 404s, /v1/leaderboard is live and caps at 50 rows
-# per call regardless of `limit`; `offset` pages correctly; `window`/`rankBy` are silently ignored.
+# per call regardless of `limit`; `offset` pages correctly, up to 1000.
+#
+# Correction 2026-09-06: the filter params were mis-named in the original probe. They are
+# `category`, `timePeriod` and `orderBy` -- not `window`/`rankBy`, which the server drops in
+# silence. All three work. The leaderboard is therefore a much larger surface than it looked:
+# 11 categories x 4 windows x 2 orderings, each pageable to 1000.
 LEADERBOARD_PAGE = 50
 TRADES_PAGE = 1000  # verified: limit=1000 returns 1000 rows, ordered timestamp DESC
 MARKET_BATCH = 20   # repeated `condition_ids` params batch fine; keeps the URL under ~2KB
@@ -56,3 +61,34 @@ FEE_FALLBACK = {
 }
 FEE_FALLBACK_DEFAULT = 0.05
 FEE_EXPONENT_DEFAULT = 1.0
+
+
+# --- Copy trading -------------------------------------------------------------------------
+# All page sizes verified live 2026-09-06 against the documented maxima.
+
+LEADERBOARD_CATEGORIES = ("OVERALL", "POLITICS", "SPORTS", "ESPORTS", "CRYPTO", "CULTURE",
+                          "MENTIONS", "WEATHER", "ECONOMICS", "TECH", "FINANCE")
+LEADERBOARD_PERIODS = ("DAY", "WEEK", "MONTH", "ALL")
+LEADERBOARD_ORDERINGS = ("PNL", "VOL")
+LEADERBOARD_MAX_OFFSET = 1000
+
+ACTIVITY_PAGE = 100           # server max is 500; 100 is plenty for a 1Hz poll
+POSITIONS_PAGE = 500
+CLOSED_POSITIONS_PAGE = 50    # server caps here whatever we ask for
+
+# Execution floors. Both are per-market and shipped by gamma as `orderMinSize` and
+# `orderPriceMinTickSize`; these are the values to assume when a market omits them. Every live
+# market sampled on 2026-09-06 used min size 5 and tick 0.001.
+MIN_ORDER_SHARES_FALLBACK = 5.0
+TICK_SIZE_FALLBACK = 0.001
+TICK_SIZES = (0.1, 0.01, 0.001, 0.0001)
+
+# Bankroll defaults. Deliberately small: the whole point of paper mode is to find out whether
+# a $100 account survives Polymarket's taker fees before any real money is exposed to them.
+DEFAULT_BANKROLL_USD = 100.0
+DEFAULT_SLIPPAGE = 0.07
+
+# feeType strings carry the category that `markets.category` never does. Matched by substring,
+# longest first, against feeType and then the (usually NULL) category column.
+FEE_TYPE_CATEGORIES = ("geopolitics", "politics", "economics", "finance", "culture", "weather",
+                       "mentions", "crypto", "sports", "tech", "world")

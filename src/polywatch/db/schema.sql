@@ -21,6 +21,7 @@ CREATE TABLE IF NOT EXISTS wallets (
 
 CREATE TABLE IF NOT EXISTS markets (
     condition_id     TEXT PRIMARY KEY,
+    gamma_id         TEXT,                 -- gamma's numeric id; what /markets/{id}/tags takes
     question         TEXT,
     slug             TEXT,
     category         TEXT,                 -- gamma's topical label; NOT the fee category
@@ -42,6 +43,12 @@ CREATE TABLE IF NOT EXISTS markets (
     fee_taker_only   INTEGER,
     fee_rebate_rate  REAL,
     fee_source       TEXT,                 -- 'market' | 'fallback' -- so Step 4 can flag guesses
+    -- Execution constraints, needed only by the trading side but shipped free with every
+    -- gamma market response, so they are stored here rather than fetched again later.
+    tick_size         REAL,                -- 0.1 | 0.01 | 0.001 | 0.0001, per market
+    order_min_size    REAL,                -- shares; commonly 5
+    accepting_orders  INTEGER,             -- goes false well before a market resolves
+    enable_order_book INTEGER,
     fetched_at       INTEGER NOT NULL
 );
 
@@ -105,3 +112,150 @@ CREATE TABLE IF NOT EXISTS ingest_log (
     ts       INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_ingest_log_kind_ts ON ingest_log(kind, ts);
+
+-- ---------------------------------------------------------------------------------------
+-- Copy trading. Everything below is written by the bot, not by ingestion.
+--
+-- The design rule here is that a run must be reconstructable afterwards from this database
+-- alone: every trade the target made that we saw, whether we copied it, and if not, why not.
+-- A skipped signal is as much of a result as a filled order.
+
+-- One row per named task. `config_json` is the whole Task dataclass; the columns beside it are
+-- duplicates, denormalised so that `task list` and ad-hoc SQL do not have to parse JSON.
+CREATE TABLE IF NOT EXISTS tasks (
+    name            TEXT PRIMARY KEY,
+    trader          TEXT NOT NULL,          -- the wallet being copied
+    mode            TEXT NOT NULL,          -- 'paper' | 'live'
+    bankroll        REAL NOT NULL,
+    buy_method      TEXT NOT NULL,          -- 'fixed' | 'mirror'
+    fixed_usd       REAL,                   -- used when buy_method='fixed'
+    max_market_usd  REAL NOT NULL,          -- ceiling on total exposure to one market
+    max_concurrent  INTEGER NOT NULL,
+    slippage        REAL NOT NULL,          -- 0.07 = accept 7% worse than the book's VWAP
+    sl_kind         TEXT,                   -- 'pct' | 'price' | NULL for none
+    sl_value        REAL,
+    tp_kind         TEXT,
+    tp_value        REAL,
+    behavior        TEXT NOT NULL,          -- 'buys' | 'buys_sells'
+    risk            TEXT NOT NULL,          -- 'conservative' | 'moderate'
+    category        TEXT,                   -- discovery preference only; does NOT block copies
+    style           TEXT NOT NULL,          -- 'safe_and_steady' | 'value_hunter' | 'momentum'
+    hold            TEXT NOT NULL,          -- 'quick_flips' | 'hours'
+    activity        TEXT NOT NULL,          -- 'casual' | 'active'
+    created_at      INTEGER NOT NULL,
+    updated_at      INTEGER NOT NULL,
+    config_json     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS task_runs (
+    id             INTEGER PRIMARY KEY,
+    task           TEXT NOT NULL REFERENCES tasks(name),
+    mode           TEXT NOT NULL,
+    started_at     INTEGER NOT NULL,
+    stopped_at     INTEGER,
+    start_bankroll REAL NOT NULL,
+    end_bankroll   REAL,
+    stop_reason    TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_task_runs_task ON task_runs(task, started_at);
+
+-- Every action of the target we observed. `action` is 'copied' or 'skipped' and `reason` names
+-- the gate that rejected it, which is the main thing a paper run is run to find out.
+CREATE TABLE IF NOT EXISTS signals (
+    id           INTEGER PRIMARY KEY,
+    run_id       INTEGER NOT NULL REFERENCES task_runs(id),
+    trader       TEXT NOT NULL,
+    kind         TEXT NOT NULL,             -- TRADE | REDEEM | MERGE | SPLIT | ...
+    tx_hash      TEXT NOT NULL,
+    token_id     TEXT NOT NULL,
+    condition_id TEXT NOT NULL,
+    side         TEXT,                      -- BUY | SELL, absent on non-trade events
+    size         REAL,                      -- shares the target moved
+    price        REAL,
+    usdc_size    REAL,
+    trader_ts    INTEGER NOT NULL,          -- when they traded
+    seen_ts      INTEGER NOT NULL,          -- when we noticed; the difference is copy latency
+    action       TEXT NOT NULL,             -- 'copied' | 'skipped'
+    reason       TEXT,
+    -- One transaction can carry several fills, same as `trades`. This tuple is what makes the
+    -- poller idempotent when consecutive polls overlap, which they always do.
+    UNIQUE (run_id, tx_hash, token_id, side, size)
+);
+CREATE INDEX IF NOT EXISTS idx_signals_run ON signals(run_id, seen_ts);
+
+CREATE TABLE IF NOT EXISTS orders (
+    id            INTEGER PRIMARY KEY,
+    run_id        INTEGER NOT NULL REFERENCES task_runs(id),
+    signal_id     INTEGER REFERENCES signals(id),   -- NULL for our own exits
+    mode          TEXT NOT NULL,            -- 'paper' | 'live'
+    token_id      TEXT NOT NULL,
+    condition_id  TEXT NOT NULL,
+    side          TEXT NOT NULL,
+    intent_usd    REAL NOT NULL,            -- what we meant to spend
+    limit_price   REAL NOT NULL,            -- slippage-bounded, tick-rounded
+    book_vwap     REAL,                     -- the book's price before our slippage allowance
+    filled_shares REAL NOT NULL DEFAULT 0,
+    avg_price     REAL,
+    fee           REAL NOT NULL DEFAULT 0,
+    status        TEXT NOT NULL,            -- 'filled' | 'partial' | 'rejected'
+    reason        TEXT,
+    ts            INTEGER NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_orders_run ON orders(run_id, ts);
+
+CREATE TABLE IF NOT EXISTS positions (
+    id            INTEGER PRIMARY KEY,
+    run_id        INTEGER NOT NULL REFERENCES task_runs(id),
+    token_id      TEXT NOT NULL,
+    condition_id  TEXT NOT NULL,
+    shares        REAL NOT NULL,
+    avg_price     REAL NOT NULL,
+    cost_usd      REAL NOT NULL,            -- excludes fees; fees_paid is tracked separately
+    fees_paid     REAL NOT NULL DEFAULT 0,
+    opened_ts     INTEGER NOT NULL,
+    closed_ts     INTEGER,
+    close_reason  TEXT,                     -- which rung of the exit ladder fired
+    realized_pnl  REAL,
+    open          INTEGER NOT NULL DEFAULT 1
+);
+CREATE INDEX IF NOT EXISTS idx_positions_run_open ON positions(run_id, open);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_positions_open_token
+    ON positions(run_id, token_id) WHERE open = 1;
+
+-- Stage 2 of discovery. One row per candidate wallet, all of it derived from
+-- /closed-positions, so a rescan overwrites cleanly.
+CREATE TABLE IF NOT EXISTS trader_scores (
+    address          TEXT PRIMARY KEY,
+    scanned_at       INTEGER NOT NULL,
+    n_closed         INTEGER NOT NULL,
+    win_rate         REAL,
+    roi              REAL,
+    realized_pnl     REAL,
+    brier            REAL,                  -- avg_price as forecast vs the 0/1 settlement
+    avg_entry_price  REAL,
+    avg_stake_usd    REAL,
+    max_drawdown     REAL,
+    consistency      REAL,                  -- share of months in profit
+    est_account_usd  REAL,                  -- from /value; the MIRROR sizing denominator
+    top_category     TEXT,
+    persona_fit      REAL,
+    rank_score       REAL,
+    metrics_json     TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_trader_scores_rank ON trader_scores(rank_score DESC);
+
+-- Execution constraints per market. Separate from `markets` because these change on their own
+-- schedule (a market stops accepting orders long before it resolves) and are only ever needed
+-- for markets we might actually trade.
+CREATE TABLE IF NOT EXISTS market_meta (
+    condition_id      TEXT PRIMARY KEY,
+    tick_size         REAL,
+    min_order_size    REAL,
+    accepting_orders  INTEGER,
+    enable_order_book INTEGER,
+    neg_risk          INTEGER,
+    category_derived  TEXT,                 -- from feeType, since markets.category is always NULL
+    fee_rate          REAL,
+    end_ts            INTEGER,
+    fetched_at        INTEGER NOT NULL
+);

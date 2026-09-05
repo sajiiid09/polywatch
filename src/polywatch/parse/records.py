@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 
-from ..config import FEE_EXPONENT_DEFAULT, FEE_FALLBACK, FEE_FALLBACK_DEFAULT
+from ..config import (FEE_EXPONENT_DEFAULT, FEE_FALLBACK, FEE_FALLBACK_DEFAULT,
+                      FEE_TYPE_CATEGORIES)
 from .fields import FieldError, iso_ts, json_str, opt, req
 
 
@@ -111,6 +112,10 @@ def parse_market(rec: dict) -> tuple[dict, list[dict]]:
 
     market = {
         "condition_id": condition_id,
+        # Gamma's own numeric id, distinct from conditionId. Needed because /markets/{id}/tags
+        # -- the only place the real category taxonomy lives -- takes this and not the
+        # condition id. Dropping it made the tags endpoint uncallable.
+        "gamma_id": opt(rec, "id", str, ctx),
         "question": opt(rec, "question", str, ctx),
         "slug": opt(rec, "slug", str, ctx),
         "category": opt(rec, "category", str, ctx),
@@ -127,6 +132,13 @@ def parse_market(rec: dict) -> tuple[dict, list[dict]]:
         "neg_risk": 1 if rec.get("negRisk") else 0,
         "fees_enabled": 1 if rec.get("feesEnabled") else 0,
         "fee_type": opt(rec, "feeType", str, ctx),
+        # Execution constraints. Read here rather than from the CLOB /tick-size endpoint
+        # because gamma already ships them alongside everything else we ingest, at no extra
+        # request. An order priced off-tick or under the min size is rejected outright.
+        "tick_size": opt(rec, "orderPriceMinTickSize", float, ctx),
+        "order_min_size": opt(rec, "orderMinSize", float, ctx),
+        "accepting_orders": 1 if rec.get("acceptingOrders") else 0,
+        "enable_order_book": 1 if rec.get("enableOrderBook") else 0,
     }
     market.update(_fee_fields(rec, ctx))
 
@@ -149,3 +161,135 @@ def parse_price_history(payload: dict) -> list[tuple[int, float]]:
         ctx = "price point"
         out.append((req(pt, "t", int, ctx), req(pt, "p", float, ctx)))
     return out
+
+
+# --- Copy trading -------------------------------------------------------------------------
+
+
+def parse_activity(payload: list) -> list[dict]:
+    """The /activity feed -- a superset of /trades, and the poller's input.
+
+    `side` is optional here in a way it never is on /trades: a REDEEM or a MERGE has no side,
+    and those rows still matter because they are how a position can vanish without a sell.
+    """
+    out = []
+    for rec in payload:
+        ctx = "activity record"
+        out.append({
+            "wallet": req(rec, "proxyWallet", str, ctx).lower(),
+            "kind": req(rec, "type", str, ctx).upper(),
+            "token_id": opt(rec, "asset", str, ctx, ""),
+            "condition_id": opt(rec, "conditionId", str, ctx, ""),
+            "side": (opt(rec, "side", str, ctx, "") or "").upper(),
+            "size": opt(rec, "size", float, ctx, 0.0),
+            "price": opt(rec, "price", float, ctx, 0.0),
+            "usdc_size": opt(rec, "usdcSize", float, ctx, 0.0),
+            "ts": req(rec, "timestamp", int, ctx),
+            "outcome": opt(rec, "outcome", str, ctx),
+            "outcome_index": opt(rec, "outcomeIndex", int, ctx),
+            "tx_hash": opt(rec, "transactionHash", str, ctx, ""),
+            "title": opt(rec, "title", str, ctx),
+            "slug": opt(rec, "slug", str, ctx),
+        })
+    return out
+
+
+def parse_positions(payload: list) -> list[dict]:
+    """A wallet's open positions. `cash_pnl` and `pct_pnl` are Polymarket's own marks."""
+    out = []
+    for rec in payload:
+        ctx = "position record"
+        out.append({
+            "wallet": req(rec, "proxyWallet", str, ctx).lower(),
+            "token_id": req(rec, "asset", str, ctx),
+            "condition_id": req(rec, "conditionId", str, ctx),
+            "shares": req(rec, "size", float, ctx),
+            "avg_price": opt(rec, "avgPrice", float, ctx, 0.0),
+            "cur_price": opt(rec, "curPrice", float, ctx, 0.0),
+            "initial_value": opt(rec, "initialValue", float, ctx, 0.0),
+            "current_value": opt(rec, "currentValue", float, ctx, 0.0),
+            "cash_pnl": opt(rec, "cashPnl", float, ctx, 0.0),
+            "pct_pnl": opt(rec, "percentPnl", float, ctx, 0.0),
+            "entry_fees": opt(rec, "entryFeesUsdc", float, ctx, 0.0),
+            "redeemable": 1 if rec.get("redeemable") else 0,
+            "outcome": opt(rec, "outcome", str, ctx),
+            "outcome_index": opt(rec, "outcomeIndex", int, ctx),
+            "title": opt(rec, "title", str, ctx),
+        })
+    return out
+
+
+def parse_closed_positions(payload: list) -> list[dict]:
+    """A wallet's settled positions -- the raw material for every skill metric.
+
+    `cost` is derived rather than read: upstream gives shares (`totalBought`) and the average
+    entry price, and the product is what was actually staked. ROI needs a denominator and this
+    is the only honest one available without replaying every fill.
+
+    `cur_price` is the settled outcome, 1 or 0, which doubles as the Brier target against
+    `avg_price` as the forecast. It is kept raw rather than coerced, because a market that
+    settled oddly should be visible as odd rather than silently rounded to a win or a loss.
+    """
+    out = []
+    for rec in payload:
+        ctx = "closed position record"
+        shares = opt(rec, "totalBought", float, ctx, 0.0)
+        avg_price = opt(rec, "avgPrice", float, ctx, 0.0)
+        out.append({
+            "wallet": req(rec, "proxyWallet", str, ctx).lower(),
+            "token_id": req(rec, "asset", str, ctx),
+            "condition_id": req(rec, "conditionId", str, ctx),
+            "shares": shares,
+            "avg_price": avg_price,
+            "cost": shares * avg_price,
+            "cur_price": opt(rec, "curPrice", float, ctx, 0.0),
+            "realized_pnl": opt(rec, "realizedPnl", float, ctx, 0.0),
+            "outcome": opt(rec, "outcome", str, ctx),
+            "outcome_index": opt(rec, "outcomeIndex", int, ctx),
+            "end_ts": iso_ts(rec, "endDate", ctx),
+            "title": opt(rec, "title", str, ctx),
+            "slug": opt(rec, "slug", str, ctx),
+        })
+    return out
+
+
+def parse_book(payload: dict) -> dict:
+    """The CLOB order book, normalised so the best price is always first.
+
+    Upstream sends both sides as price-ascending strings, which means the best bid is at the
+    END of the bids list and the best ask at the START of the asks list -- an asymmetry that is
+    very easy to get backwards and produces a plausible-looking wrong price when you do. Sorting
+    here means copytrade/book.py can walk either side with the same loop.
+    """
+    if not isinstance(payload, dict):
+        raise FieldError(f"book: expected dict, got {type(payload).__name__}")
+
+    def levels(key: str) -> list[tuple[float, float]]:
+        rows = payload.get(key) or []
+        out = []
+        for lv in rows:
+            ctx = f"book {key} level"
+            out.append((req(lv, "price", float, ctx), req(lv, "size", float, ctx)))
+        return out
+
+    return {
+        "token_id": opt(payload, "asset_id", str, "book", ""),
+        "condition_id": opt(payload, "market", str, "book", ""),
+        "bids": sorted(levels("bids"), key=lambda lv: -lv[0]),
+        "asks": sorted(levels("asks"), key=lambda lv: lv[0]),
+    }
+
+
+def derive_category(fee_type: str | None, category: str | None = None) -> str | None:
+    """Best-effort market category from the fee type.
+
+    `markets.category` is NULL for every market we have ingested, but `feeType` reads
+    'sports_fees_v3', 'crypto_fees_v2', 'politics_fees' and so on -- the taxonomy is there, just
+    wearing a different hat. Matching it costs nothing, where gamma's /tags endpoint costs one
+    request per market. Longest match first so 'geopolitics' never reads as 'politics'.
+    """
+    hay = f"{(fee_type or '').lower()} {(category or '').lower()}"
+    for key in sorted(FEE_TYPE_CATEGORIES, key=len, reverse=True):
+        if key in hay:
+            return key
+    return None

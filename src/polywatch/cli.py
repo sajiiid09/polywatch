@@ -1,7 +1,14 @@
 """polywatch CLI.
 
-Read-only analytics. There is no order command, no key handling, and no signing path -- by
-design, and that is not a gap to be filled later.
+Originally read-only analytics, with a note here saying an order path was not a gap to be
+filled later. It is being filled: the `trader` and `task` commands below exist to find a wallet
+worth copying and then copy it.
+
+The read-only guarantee has moved down a layer rather than disappearing. `fetch/client.py` is
+still GET-only with no auth and no signing, and paper mode never signs anything at all. When
+live execution arrives it will live in exactly one module, behind an explicit flag and an
+optional dependency, so that "does this program spend money" stays a question with a one-file
+answer.
 """
 
 from __future__ import annotations
@@ -74,6 +81,13 @@ def main(argv=None) -> int:
     pa.add_argument("token_id")
     pa.add_argument("ts", type=int)
 
+    tr = sub.add_parser("trader", help="skill score card for one wallet")
+    tr.add_argument("address")
+    tr.add_argument("--pages", type=int, default=20,
+                    help="settled-position pages to pull; 50 rows each")
+    tr.add_argument("--rps", type=float, default=MAX_RPS)
+    tr.add_argument("--json", action="store_true")
+
     args = p.parse_args(argv)
 
     if args.cmd == "init-db":
@@ -133,6 +147,24 @@ def main(argv=None) -> int:
     if args.cmd == "price-at":
         con = store.connect(args.db)
         print(store.price_at(con, args.token_id, args.ts))
+        return 0
+
+    if args.cmd == "trader":
+        from .copytrade import discover
+        from .fetch.client import Client
+        con = store.connect(args.db)
+        store.init_db(con)
+        client = Client(con=con, rps=args.rps)
+        sc, est = discover.score_trader(con, client, args.address, max_pages=args.pages)
+        if args.json:
+            print(json.dumps({**sc.as_row(), "est_account_usd": est}, indent=2))
+            return 0
+        row = con.execute("SELECT username FROM wallets WHERE address=?",
+                          (args.address.lower(),)).fetchone()
+        print()
+        print(discover.format_score(sc, est, row["username"] if row else None))
+        if sc.n_closed == 0:
+            print("\n  no settled positions -- nothing to judge this wallet on")
         return 0
 
     return 1
