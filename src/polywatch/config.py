@@ -92,3 +92,83 @@ DEFAULT_SLIPPAGE = 0.07
 # longest first, against feeType and then the (usually NULL) category column.
 FEE_TYPE_CATEGORIES = ("geopolitics", "politics", "economics", "finance", "culture", "weather",
                        "mentions", "crypto", "sports", "tech", "world")
+
+
+# --- Backtest -----------------------------------------------------------------------------
+# The replay has no historical order books, so our fill price is the target's own fill price
+# worsened by a flat penalty. That one number stands in for both the book walk and copy
+# latency, which makes it the largest modelling assumption in the whole backtest -- so the CLI
+# sweeps it by default rather than quoting a single figure that hides it.
+BACKTEST_SLIPPAGE_SWEEP = (0.0, 0.03, 0.07)
+
+# Ceiling on MIRROR sizing, as a fraction of bankroll. /value reports open positions only and
+# excludes idle cash, so the denominator is a floor on the target's account and every mirrored
+# fraction it produces is an overstatement. Without a cap, one trade by a wallet whose cash
+# sits idle would size to the whole bankroll.
+MIRROR_MAX_FRACTION = 0.10
+
+# Stake per copied trade, as a fraction of bankroll. `stake x max_concurrent` is the share of
+# the account deployed at once, and it turned out to matter more than anything else the backtest
+# measures: at 2% x 5 slots (10% deployed) five of six screened wallets finished profitable even
+# at 7% slippage, while at 10% x 10 slots (fully deployed) four of the six were wiped out at
+# every slippage. A small bankroll dies of ruin long before it dies of a bad trader.
+DEFAULT_STAKE_FRACTION = 0.02
+
+# Below this a position is dust: worth less than the fee to close it, and kept open it would
+# distort every open-position count the gates read.
+MIN_POSITION_USD = 0.01
+
+
+# --- Discovery funnel ---------------------------------------------------------------------
+# Four stages ordered by cost per wallet, so expensive evidence is only gathered for wallets
+# that survived the cheap evidence.
+
+# Leaderboard pages per (category, period, ordering) combination. 11 x 4 x 2 x this many calls.
+# Two pages is 100 wallets per combination, which after dedupe is a candidate pool in the high
+# hundreds -- plenty, and still under 200 requests.
+SWEEP_PAGES_PER_COMBO = 2
+
+# Walk-forward split. Wallets are RANKED on [now - RANK_WINDOW_DAYS, now - VALIDATION_DAYS] and
+# then VALIDATED on the unseen days since. Ranking a wallet on the same history you judge it by
+# is curve fitting, and the whole point of the split is that the second number was never
+# available to the first.
+RANK_WINDOW_DAYS = 60
+VALIDATION_DAYS = 7
+
+# A wallet must have traded this recently to be worth copying at all. Two days rather than the
+# screen's usual seven: a wallet that last traded six days ago may simply have stopped, and
+# copying silence produces no trades and no information.
+MAX_RECENCY_DAYS_ACTIVE = 2.0
+
+# Below this many settled positions before the cutoff, the metrics are noise. skill.brier makes
+# the same point: a Brier over four markets means nothing.
+MIN_SETTLED_FOR_RANK = 30
+
+# Pre-cutoff settled positions to gather before paging stops. /closed-positions is newest
+# first, so a prolific wallet's first pages sit entirely inside the validation window and are
+# filtered away by the cutoff -- paging has to continue until enough OLD positions are in hand,
+# and a flat page cap would silently score those wallets on almost nothing. Well above
+# MIN_SETTLED_FOR_RANK so the metrics are stable, well below the 1,000-row ceiling so a deep
+# history does not cost twenty requests.
+RANK_SAMPLE_TARGET = 200
+
+# Parallel fetchers for the scoring stage. Shares one global rate limiter, so this raises
+# throughput without raising the request rate.
+RANK_WORKERS = 4
+
+# How many top-ranked wallets get the expensive walk-forward treatment.
+FINALIST_COUNT = 15
+
+# rank_score weights. Explicit rather than tuned: every one of these is a claim about what
+# makes a trader copyable, and a reader should be able to disagree with a specific number.
+RANK_WEIGHTS = {
+    "calibration": 0.30,   # 1 - brier/0.25; the only metric measuring judgement not outcome
+    "consistency": 0.25,   # share of months in profit; small wins over time beat one big score
+    "roi": 0.20,           # return per dollar deployed, which is what copying reproduces
+    "drawdown": 0.15,      # 1 - max_drawdown; a bad number here is damning
+    "evidence": 0.10,      # min(n_closed/100, 1); stops a short record outranking a long one
+}
+
+# Brier score of forecasting 0.5 on everything. At or above it the entry prices carry no
+# information whatever the PnL says, so calibration scores zero rather than merely poorly.
+BRIER_COINFLIP = 0.25

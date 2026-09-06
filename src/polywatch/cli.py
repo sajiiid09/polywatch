@@ -18,7 +18,9 @@ import json
 from datetime import datetime, timezone
 
 from . import ingest
-from .config import DB_PATH, MAX_RPS
+from .config import (BACKTEST_SLIPPAGE_SWEEP, DB_PATH, DEFAULT_BANKROLL_USD,
+                     DEFAULT_STAKE_FRACTION, FINALIST_COUNT, MAX_RPS,
+                     RANK_WINDOW_DAYS)
 from .db import store
 from .screen import Thresholds, screen as run_screen
 
@@ -87,6 +89,62 @@ def main(argv=None) -> int:
                     help="settled-position pages to pull; 50 rows each")
     tr.add_argument("--rps", type=float, default=MAX_RPS)
     tr.add_argument("--json", action="store_true")
+
+    bt = sub.add_parser("backtest", help="replay a wallet's ingested history at a $100 bankroll")
+    bt.add_argument("trader", help="wallet address to copy")
+    bt.add_argument("--name", default=None, help="task name; defaults to backtest-<address>")
+    bt.add_argument("--bankroll", type=float, default=DEFAULT_BANKROLL_USD)
+    bt.add_argument("--buy-method", choices=["fixed", "mirror"], default="fixed")
+    bt.add_argument("--fixed-usd", type=float, default=None,
+                    help="stake per copied trade; defaults to 2%% of bankroll")
+    bt.add_argument("--max-market-usd", type=float, default=None,
+                    help="exposure ceiling per market; defaults to twice the stake")
+    bt.add_argument("--max-concurrent", type=int, default=5)
+    bt.add_argument("--behavior", choices=["buys", "buys_sells"], default="buys_sells")
+    bt.add_argument("--risk", choices=["conservative", "moderate"], default="moderate")
+    bt.add_argument("--style", choices=["safe_and_steady", "value_hunter", "momentum"],
+                    default="momentum")
+    bt.add_argument("--since", default=None, help="ignore trades before this date (UTC)")
+    bt.add_argument("--slippage", type=float, default=None,
+                    help="single slippage assumption; default sweeps 0%%/3%%/7%% instead")
+    bt.add_argument("--json", action="store_true")
+
+    rc = sub.add_parser("recommend",
+                        help="sweep the leaderboard and recommend one wallet to copy")
+    rc.add_argument("--bankroll", type=float, default=DEFAULT_BANKROLL_USD)
+    rc.add_argument("--finalists", type=int, default=FINALIST_COUNT,
+                    help="how many top-ranked wallets get walk-forward validated")
+    rc.add_argument("--rps", type=float, default=MAX_RPS)
+    fo = sub.add_parser("follow",
+                        help="evaluate any Polymarket address and register it for copying")
+    fo.add_argument("trader", help="wallet address, 0x + 40 hex characters")
+    fo.add_argument("--name", default=None, help="task name; defaults to follow-<address>")
+    fo.add_argument("--bankroll", type=float, default=DEFAULT_BANKROLL_USD)
+    fo.add_argument("--fixed-usd", type=float, default=None,
+                    help="stake per copied trade; defaults to 2%% of bankroll")
+    fo.add_argument("--max-concurrent", type=int, default=5)
+    fo.add_argument("--behavior", choices=["buys", "buys_sells"], default="buys_sells")
+    fo.add_argument("--days", type=int, default=RANK_WINDOW_DAYS,
+                    help="how much history to pull and backtest over")
+    fo.add_argument("--rps", type=float, default=MAX_RPS)
+    fo.add_argument("--no-fetch", action="store_true",
+                    help="use only what is already stored; makes no network calls")
+    fo.add_argument("--json", action="store_true")
+
+    sv = sub.add_parser("serve", help="local web console")
+    sv.add_argument("--host", default="127.0.0.1",
+                    help="bind address; anything but localhost exposes an unauthenticated "
+                         "console that can rewrite the database")
+    sv.add_argument("--port", type=int, default=8787)
+    sv.add_argument("--rps", type=float, default=MAX_RPS)
+
+    rc.add_argument("--reuse-scan", action="store_true",
+                    help="skip the sweep and recon, screening what is already stored; only "
+                         "sound when the existing recon is fresh")
+    rc.add_argument("--reuse-scores", action="store_true",
+                    help="also skip scoring and re-rank the stored metrics; the path to take "
+                         "after changing a weight or the calibration formula")
+    rc.add_argument("--json", action="store_true")
 
     args = p.parse_args(argv)
 
@@ -165,6 +223,134 @@ def main(argv=None) -> int:
         print(discover.format_score(sc, est, row["username"] if row else None))
         if sc.n_closed == 0:
             print("\n  no settled positions -- nothing to judge this wallet on")
+        return 0
+
+    if args.cmd == "backtest":
+        from .copytrade import replay
+        from .copytrade.task import Task
+        con = store.connect(args.db)
+        store.init_db(con)
+        address = args.trader.lower()
+        sweep = [args.slippage] if args.slippage is not None else list(BACKTEST_SLIPPAGE_SWEEP)
+        # Stake defaults to a fraction of bankroll rather than a flat dollar amount, because
+        # `stake x max_concurrent` is what actually decides whether a run can survive a losing
+        # streak. At $10 a trade with 10 slots a $100 account is 100% deployed at all times and
+        # ten consecutive losers end it -- measured across six screened wallets, that config
+        # ruined four of them at every slippage, while 10% deployment left five profitable.
+        fixed = args.fixed_usd if args.fixed_usd is not None \
+            else args.bankroll * DEFAULT_STAKE_FRACTION
+        max_market = args.max_market_usd if args.max_market_usd is not None else fixed * 2
+        since = _ts(args.since) if args.since else 0
+
+        out = []
+        for slip in sweep:
+            task = Task(
+                # One task row per slippage point, so a sweep leaves three runs that can be
+                # compared in SQL afterwards rather than one that overwrites itself.
+                name=(args.name or f"backtest-{address[:10]}") + f"-s{int(slip * 1000):03d}",
+                trader=address, mode="paper", bankroll=args.bankroll,
+                buy_method=args.buy_method, fixed_usd=fixed,
+                max_market_usd=max_market, max_concurrent=args.max_concurrent,
+                slippage=slip, behavior=args.behavior, risk=args.risk, style=args.style,
+            )
+            out.append((task, replay.run(con, task, slip, since_ts=since)))
+
+        if args.json:
+            print(json.dumps([s for _, s in out], indent=2, default=float))
+            return 0
+
+        for task, summary in out:
+            print()
+            print(replay.format_report(summary, task))
+        if len(out) > 1:
+            print()
+            print("  slippage is an assumption, not a measurement -- the spread across these "
+                  "three\n  runs is how much of the answer rests on it.")
+        return 0
+
+    if args.cmd == "serve":
+        from .web.server import serve
+        serve(args.db, host=args.host, port=args.port, rps=args.rps)
+        return 0
+
+    if args.cmd == "follow":
+        import time as _time
+        from .copytrade import replay, select
+        from .copytrade.task import Task
+        from .fetch.client import Client
+        con = store.connect(args.db)
+        store.init_db(con)
+        address = select.valid_address(args.trader)
+        since = int(_time.time()) - args.days * 86400
+
+        if not args.no_fetch:
+            client = Client(con=con, rps=args.rps, dump_raw=False)
+            print(f"preparing {address}")
+            n = select.prepare_wallet(con, client, address, since, log=print)
+            if n == 0:
+                print(f"\nNo trades found for {address} in the last {args.days} days.")
+                print("Either the address has not traded recently, or it is not a "
+                      "Polymarket trading wallet.")
+                return 1
+
+        stake = args.fixed_usd if args.fixed_usd is not None \
+            else args.bankroll * DEFAULT_STAKE_FRACTION
+        base = args.name or f"follow-{address[:10]}"
+        out = []
+        for slip in BACKTEST_SLIPPAGE_SWEEP:
+            task = Task(name=f"{base}-s{int(slip * 1000):03d}", trader=address,
+                        bankroll=args.bankroll, fixed_usd=stake, max_market_usd=stake * 2,
+                        max_concurrent=args.max_concurrent, slippage=slip,
+                        behavior=args.behavior)
+            out.append((task, replay.run(con, task, slip, since_ts=since)))
+
+        # The registered task is the one at the pessimistic slippage: if a follow is going to be
+        # acted on, it should be configured for the assumption that execution goes badly.
+        keeper = Task(name=base, trader=address, bankroll=args.bankroll, fixed_usd=stake,
+                      max_market_usd=stake * 2, max_concurrent=args.max_concurrent,
+                      slippage=max(BACKTEST_SLIPPAGE_SWEEP), behavior=args.behavior)
+        store.upsert_task(con, keeper.to_row())
+
+        if args.json:
+            print(json.dumps([s for _, s in out], indent=2, default=float))
+            return 0
+        for task, summary in out:
+            print()
+            print(replay.format_report(summary, task))
+        print(f"\n  registered as task '{base}' (paper mode).")
+        print("  Live execution is not built -- see the plan's Phase 2c.")
+        return 0
+
+    if args.cmd == "recommend":
+        from .copytrade import select
+        from .fetch.client import Client
+        con = store.connect(args.db)
+        store.init_db(con)
+        # The sweep and the poller both hammer one endpoint repeatedly; dumping every response
+        # to disk would write hundreds of near-identical files for no audit value.
+        client = Client(con=con, rps=args.rps, dump_raw=False)
+        funnel, finalists = select.run(con, client, bankroll=args.bankroll,
+                                       finalists=args.finalists,
+                                       reuse_scan=args.reuse_scan,
+                                       reuse_scores=args.reuse_scores)
+        _, cutoff = select.windows()
+        if args.json:
+            print(json.dumps({
+                "funnel": funnel.__dict__,
+                "cutoff": cutoff,
+                "finalists": [{
+                    "address": f.ranked.address, "username": f.username,
+                    "rank_score": f.ranked.rank_score,
+                    "components": f.ranked.components,
+                    "metrics": f.ranked.score.as_row(),
+                    "out_of_sample": {str(k): v for k, v in f.out_of_sample.items()},
+                    "positions_closed": f.closed,
+                    "disqualifiers": f.disqualifiers,
+                } for f in finalists],
+            }, indent=2, default=float))
+            return 0
+        print()
+        print(select.format_report(funnel, finalists, args.bankroll, cutoff))
         return 0
 
     return 1
