@@ -1,0 +1,103 @@
+"""What a run actually did, read back out of the database.
+
+Two audiences. The skip histogram and the latency table are for tuning: they say whether the
+poll interval is right, whether the gates are too tight, and whether this trader can be copied
+at all. The PnL and fee lines are for the only question that matters -- whether the edge
+survives the round trip.
+"""
+
+from __future__ import annotations
+
+from datetime import datetime, timezone
+
+from ..db import store
+from . import exits
+
+
+def _dt(ts: int | None) -> str:
+    return "-" if not ts else datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+def latency_block(stats: dict, poll_interval_s: float) -> list[str]:
+    """Measured copy latency: seen_ts - trader_ts, per signal.
+
+    Read against the poll interval. If p50 is roughly half the interval the poller is keeping
+    up and the residual is the feed's own lag; if p50 approaches the interval, polls are
+    overrunning. If p90 exceeds the staleness gate, most of what this trader does is
+    uncopyable at this cadence whatever the median says.
+    """
+    if not stats.get("n"):
+        return ["  latency        no signals observed"]
+    out = [f"  latency        n={stats['n']}  p50 {stats['p50']}s  p90 {stats['p90']}s  "
+           f"p99 {stats['p99']}s  max {stats['max']}s  (poll {poll_interval_s:.0f}s)"]
+    if stats["p50"] > poll_interval_s * 1.5:
+        out.append(f"                 p50 exceeds the poll interval -- the feed is lagging, "
+                   f"not the loop")
+    return out
+
+
+def run_report(con, run_id: int, task=None) -> str:
+    run = con.execute("SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
+    if run is None:
+        raise KeyError(f"no run {run_id}")
+    s = store.run_summary(con, run_id)
+    poll = task.poll_interval_s if task is not None else 0.0
+
+    lines = [
+        f"run {run_id}  task {run['task']}  {run['mode'].upper()}",
+        f"  started        {_dt(run['started_at'])}   stopped {_dt(run['stopped_at'])}"
+        f"   ({run['stop_reason'] or 'running'})",
+        f"  bankroll       ${run['start_bankroll']:,.2f} -> ${s['cash']:,.2f}",
+        f"  realized pnl   ${s['realized_pnl']:+,.2f}   fees ${s['fees_paid']:,.2f}",
+        f"  signals        {s['signals_seen']} seen, {s['copied']} copied, "
+        f"{s['skipped']} skipped",
+        f"  positions      {s['positions_closed']} closed, {s['positions_open']} still open",
+    ]
+    lines += latency_block(store.latency_stats(con, run_id), poll)
+
+    if s["realized_pnl"] and s["fees_paid"]:
+        gross = s["realized_pnl"] + s["fees_paid"]
+        lines.append(f"  fee drag       ${s['fees_paid']:,.2f} on ${gross:+,.2f} gross "
+                     f"({s['fees_paid'] / abs(gross):.0%} of it)" if gross else "")
+
+    skips = store.skip_reasons(con, run_id)
+    if skips:
+        lines += ["", "  why trades were skipped"]
+        width = max(len(r or "?") for r, _ in skips)
+        for reason, n in skips:
+            lines.append(f"    {(reason or '?'):<{width}}  {n}")
+
+    closed = con.execute(
+        """SELECT * FROM positions WHERE run_id=? AND open=0 ORDER BY closed_ts""",
+        (run_id,)).fetchall()
+    if closed:
+        lines += ["", "  closed positions",
+                  f"    {'token':<12} {'shares':>8} {'entry':>7} {'pnl':>9} {'held':>7}  why"]
+        for p in closed:
+            held = (p["closed_ts"] - p["opened_ts"]) / 60 if p["closed_ts"] else 0
+            lines.append(f"    {p['token_id'][:12]:<12} {p['shares']:8.1f} "
+                         f"{p['avg_price']:7.3f} {p['realized_pnl']:+9.2f} {held:6.0f}m  "
+                         f"{p['close_reason'] or ''}")
+
+    rest = con.execute(
+        "SELECT * FROM resting_orders WHERE run_id=? AND status='open'", (run_id,)).fetchall()
+    if rest:
+        lines += ["", f"  {len(rest)} resting sell order(s) still on the book:"]
+        for r in rest:
+            lines.append(f"    {r['shares']:.1f} @ {r['price']:.3f}  {r['token_id'][:12]}"
+                         f"  {r['exchange_id'] or '(paper)'}")
+    return "\n".join(x for x in lines if x != "")
+
+
+def exit_mix(con, run_id: int) -> list[tuple[str, int, float]]:
+    """Which rung of the ladder closed positions, and what each one earned.
+
+    The shape to look for: take_profit and follow_exit carrying the PnL, stop_loss bounded and
+    infrequent, max_hold near zero. A run where max_hold dominates is one where the trader's
+    edge is slower than the task assumes it is.
+    """
+    rows = con.execute(
+        """SELECT close_reason, COUNT(*), COALESCE(SUM(realized_pnl),0) FROM positions
+           WHERE run_id=? AND open=0 GROUP BY close_reason ORDER BY COUNT(*) DESC""",
+        (run_id,)).fetchall()
+    return [(r[0] or exits.SESSION_END, int(r[1]), float(r[2])) for r in rows]

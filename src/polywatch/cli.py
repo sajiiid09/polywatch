@@ -5,10 +5,10 @@ filled later. It is being filled: the `trader` and `task` commands below exist t
 worth copying and then copy it.
 
 The read-only guarantee has moved down a layer rather than disappearing. `fetch/client.py` is
-still GET-only with no auth and no signing, and paper mode never signs anything at all. When
-live execution arrives it will live in exactly one module, behind an explicit flag and an
-optional dependency, so that "does this program spend money" stays a question with a one-file
-answer.
+still GET-only with no auth and no signing, and paper mode never signs anything at all. Live
+execution lives in exactly one module -- copytrade/execution.py, class LiveExecutor -- behind an
+explicit --mode live, an optional dependency and a typed confirmation, so that "does this
+program spend money" stays a question with a one-file answer.
 """
 
 from __future__ import annotations
@@ -18,7 +18,8 @@ import json
 from datetime import datetime, timezone
 
 from . import ingest
-from .config import DB_PATH, MAX_RPS
+from .config import DB_PATH, DEFAULT_BANKROLL_USD, MAX_RPS
+from .copytrade import task as task_mod
 from .db import store
 from .screen import Thresholds, screen as run_screen
 
@@ -87,6 +88,63 @@ def main(argv=None) -> int:
                     help="settled-position pages to pull; 50 rows each")
     tr.add_argument("--rps", type=float, default=MAX_RPS)
     tr.add_argument("--json", action="store_true")
+
+
+    tk = sub.add_parser("task", help="create and run a copy-trading task")
+    tsub = tk.add_subparsers(dest="task_cmd", required=True)
+
+    tc = tsub.add_parser("create", help="create or update a task")
+    tc.add_argument("name")
+    tc.add_argument("--trader", required=True, help="wallet to copy")
+    tc.add_argument("--preset", default="quick_flips", choices=sorted(task_mod.PRESETS),
+                    help="quick_flips is what the poller is tuned for; hours loosens the "
+                         "exits for an idea you intend to babysit yourself")
+    tc.add_argument("--bankroll", type=float, default=DEFAULT_BANKROLL_USD)
+    tc.add_argument("--stake", type=float, default=10.0, help="USD per copied trade (fixed)")
+    tc.add_argument("--mirror", action="store_true",
+                    help="size as a fraction of their account instead of a fixed stake")
+    tc.add_argument("--max-market-usd", type=float, default=None)
+    tc.add_argument("--max-concurrent", type=int, default=None)
+    tc.add_argument("--slippage", type=float, default=None)
+    tc.add_argument("--stop-loss", type=float, default=None,
+                    help="fraction off entry, e.g. 0.15; 0 disables")
+    tc.add_argument("--take-profit", type=float, default=None,
+                    help="fraction above entry, e.g. 0.10; 0 disables")
+    tc.add_argument("--trail", type=float, default=None, help="trailing stop fraction; 0 off")
+    tc.add_argument("--max-hold-min", type=float, default=None)
+    tc.add_argument("--poll", type=float, default=None, help="seconds between polls")
+    tc.add_argument("--session-hours", type=float, default=None)
+    tc.add_argument("--max-loss", type=float, default=None, help="stop the run down this much")
+    tc.add_argument("--max-drawdown", type=float, default=None)
+    tc.add_argument("--no-resting-tp", action="store_true",
+                    help="watch for the target and sell at market instead of leaving a GTC "
+                         "sell order on the book")
+    tc.add_argument("--no-follow-exit", action="store_true",
+                    help="do not sell when the trader sells")
+    tc.add_argument("--no-flatten", action="store_true",
+                    help="leave positions open when the session ends (nothing then watches "
+                         "the stop-loss)")
+
+    tsub.add_parser("list", help="every saved task")
+    tsh = tsub.add_parser("show", help="one task's full config")
+    tsh.add_argument("name")
+    trm = tsub.add_parser("rm", help="delete a task")
+    trm.add_argument("name")
+
+    trn = tsub.add_parser("run", help="start a copy-trading session")
+    trn.add_argument("name")
+    trn.add_argument("--mode", choices=("paper", "live"), default=None,
+                     help="overrides the task's mode for this run only")
+    trn.add_argument("--session-hours", type=float, default=None)
+    trn.add_argument("--yes", action="store_true", help="skip the live-mode confirmation")
+
+    trp = tsub.add_parser("report", help="what a run did")
+    trp.add_argument("name")
+    trp.add_argument("--run-id", type=int, default=None, help="defaults to the latest run")
+    trp.add_argument("--json", action="store_true")
+
+    tor = tsub.add_parser("orders", help="resting GTC orders left on the book")
+    tor.add_argument("--cancel", action="store_true", help="cancel every live one")
 
     args = p.parse_args(argv)
 
@@ -166,6 +224,11 @@ def main(argv=None) -> int:
         if sc.n_closed == 0:
             print("\n  no settled positions -- nothing to judge this wallet on")
         return 0
+
+
+    if args.cmd == "task":
+        from .copytrade import commands
+        return commands.dispatch(args)
 
     return 1
 

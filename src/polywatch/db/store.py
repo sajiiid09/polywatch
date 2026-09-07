@@ -570,3 +570,91 @@ def upsert_market_meta(con: sqlite3.Connection, row: dict) -> None:
 def get_market_meta(con: sqlite3.Connection, condition_id: str) -> sqlite3.Row | None:
     return con.execute("SELECT * FROM market_meta WHERE condition_id=?",
                        (condition_id,)).fetchone()
+
+
+# --- resting exit orders --------------------------------------------------
+# A GTC sell left on the book. In live mode this outlives the process, which is the whole point
+# of it and also the reason it is a table rather than a variable: the next run has to be able to
+# find orders the last one left behind, and either adopt or cancel them.
+
+RESTING_COLUMNS = ("run_id", "position_id", "mode", "token_id", "condition_id", "side",
+                   "shares", "price", "kind", "exchange_id", "status", "filled_shares",
+                   "avg_price", "reason", "placed_ts", "settled_ts")
+
+
+def insert_resting(con: sqlite3.Connection, row: dict) -> int:
+    row.setdefault("placed_ts", int(time.time()))
+    row.setdefault("status", "open")
+    row.setdefault("filled_shares", 0.0)
+    for c in RESTING_COLUMNS:
+        row.setdefault(c, None)
+    cols = ",".join(RESTING_COLUMNS)
+    binds = ",".join(f":{c}" for c in RESTING_COLUMNS)
+    cur = con.execute(f"INSERT INTO resting_orders ({cols}) VALUES ({binds})", row)
+    con.commit()
+    return int(cur.lastrowid)
+
+
+def open_resting(con: sqlite3.Connection, run_id: int) -> list[sqlite3.Row]:
+    return con.execute(
+        "SELECT * FROM resting_orders WHERE run_id=? AND status='open' ORDER BY placed_ts",
+        (run_id,)).fetchall()
+
+
+def resting_for_position(con: sqlite3.Connection, position_id: int) -> list[sqlite3.Row]:
+    return con.execute(
+        "SELECT * FROM resting_orders WHERE position_id=? AND status='open'",
+        (position_id,)).fetchall()
+
+
+def settle_resting(con: sqlite3.Connection, resting_id: int, status: str,
+                   filled_shares: float = 0.0, avg_price: float | None = None,
+                   reason: str | None = None) -> None:
+    con.execute(
+        """UPDATE resting_orders
+           SET status=?, filled_shares=?, avg_price=?, reason=?, settled_ts=?
+           WHERE id=?""",
+        (status, filled_shares, avg_price, reason, int(time.time()), resting_id),
+    )
+    con.commit()
+
+
+def orphan_resting(con: sqlite3.Connection, mode: str = "live") -> list[sqlite3.Row]:
+    """Live orders still marked open on the book from a run that has already stopped.
+
+    A killed process leaves real orders resting on a real exchange. They are not a bug to be
+    hidden -- a take-profit that fills after the bot exits is the feature working -- but the
+    next run has to be told about them rather than discovering the shares are gone.
+    """
+    return con.execute(
+        """SELECT r.* FROM resting_orders r JOIN task_runs t ON t.id = r.run_id
+           WHERE r.status='open' AND r.mode=? AND t.stopped_at IS NOT NULL
+           ORDER BY r.placed_ts""", (mode,)).fetchall()
+
+
+def latency_samples(con: sqlite3.Connection, run_id: int | None = None) -> list[int]:
+    """seen_ts - trader_ts for every signal: how late we were, in seconds.
+
+    This is measured, not assumed, and it is the number that decides whether copying a fast
+    trader is possible at all. Both columns have always been on `signals` for exactly this.
+    """
+    sql = "SELECT seen_ts - trader_ts FROM signals"
+    args: tuple = ()
+    if run_id is not None:
+        sql += " WHERE run_id=?"
+        args = (run_id,)
+    return [int(r[0]) for r in con.execute(sql, args) if r[0] is not None]
+
+
+def latency_stats(con: sqlite3.Connection, run_id: int | None = None) -> dict:
+    """Percentiles of copy latency. Nearest-rank, so p50 of an even sample is a real
+    observation rather than an average of two that never happened."""
+    xs = sorted(latency_samples(con, run_id))
+    if not xs:
+        return {"n": 0}
+
+    def pct(p: float) -> int:
+        return xs[min(len(xs) - 1, max(0, int(round(p / 100 * len(xs) + 0.5)) - 1))]
+
+    return {"n": len(xs), "min": xs[0], "p50": pct(50), "p90": pct(90), "p99": pct(99),
+            "max": xs[-1], "mean": sum(xs) / len(xs)}

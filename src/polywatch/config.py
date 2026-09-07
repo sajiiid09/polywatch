@@ -92,3 +92,53 @@ DEFAULT_SLIPPAGE = 0.07
 # longest first, against feeType and then the (usually NULL) category column.
 FEE_TYPE_CATEGORIES = ("geopolitics", "politics", "economics", "finance", "culture", "weather",
                        "mentions", "crypto", "sports", "tech", "world")
+
+
+# --- Copy-trading engine ------------------------------------------------------------------
+
+# Poll cadence for /activity. 15s, not 1s: data-api caches the activity feed, so polling faster
+# than the cache refreshes buys nothing but rate-limit risk and a bigger ingest_log. Whether
+# that is the right number is not assumed -- every signal stores seen_ts and trader_ts, and
+# `task report` prints the observed distribution of the difference. Tune this from that table,
+# not from this comment.
+POLL_INTERVAL_S = 15.0
+POLL_OVERLAP_S = 120        # how far back each poll re-reads, so a slow page cannot drop a fill
+POLL_TIMEOUT_S = 5.0        # a 30s socket timeout inside the loop would freeze the stop-loss
+
+# A quick-flip trader's edge decays in minutes. Copying a fill we noticed four minutes late is
+# not copying them, it is buying whatever they already moved. Signals older than this are
+# skipped and counted -- if most skips are 'stale' the poll interval is wrong, or the trader is
+# too fast to copy at all.
+MAX_SIGNAL_AGE_S = 120
+
+# Session bound. The bot is not meant to run unattended: stop-loss and trailing exits are
+# enforced by this process, so when it is not running they are not enforced either. A run ends
+# at this age and flattens whatever it is holding.
+SESSION_MAX_HOURS = 5.0
+FLATTEN_AT_SESSION_END = True
+
+# Exit ladder defaults, quick-flip shaped.
+DEFAULT_STOP_LOSS_PCT = 0.15      # off avg entry, after fees
+DEFAULT_TAKE_PROFIT_PCT = 0.10
+DEFAULT_TRAIL_PCT = 0.0           # 0 disables; 0.06 trails 6% off the high-water mark
+DEFAULT_MAX_HOLD_S = 2700         # 45 min. A quick flip that is still open after this failed.
+DEFAULT_MAX_CONCURRENT = 3
+DEFAULT_MAX_MARKET_USD = 25.0
+
+# Run-level circuit breakers. Hit either and the run stops and flattens -- the point of a
+# 4-hour session is to be able to lose a bounded amount while not watching it.
+DEFAULT_MAX_DAILY_LOSS_USD = 20.0
+DEFAULT_MAX_DRAWDOWN_PCT = 0.25
+
+# Market-close guard. Liquidity thins and the book gaps as a market approaches resolution, so
+# entering here is how a quick flip turns into an unsellable position.
+MIN_SECONDS_TO_CLOSE = 900
+# Price band. Fees are proportional to min(p, 1-p), and the book is thinnest at the extremes.
+MIN_ENTRY_PRICE = 0.05
+MAX_ENTRY_PRICE = 0.95
+
+# Live trading. Read from the environment, never stored in the database or a config file.
+ENV_PRIVATE_KEY = "POLYMARKET_PRIVATE_KEY"
+ENV_FUNDER = "POLYMARKET_FUNDER"        # the proxy/funder address that holds the USDC
+ENV_API_CREDS = ("POLYMARKET_API_KEY", "POLYMARKET_API_SECRET", "POLYMARKET_API_PASSPHRASE")
+CLOB_CHAIN_ID = 137                      # Polygon mainnet
