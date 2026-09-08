@@ -599,250 +599,89 @@ def get_market_meta(con: sqlite3.Connection, condition_id: str) -> sqlite3.Row |
                        (condition_id,)).fetchone()
 
 
-# --- Backtest support ----------------------------------------------------------------------
+# --- resting exit orders --------------------------------------------------
+# A GTC sell left on the book. In live mode this outlives the process, which is the whole point
+# of it and also the reason it is a table rather than a variable: the next run has to be able to
+# find orders the last one left behind, and either adopt or cancel them.
+
+RESTING_COLUMNS = ("run_id", "position_id", "mode", "token_id", "condition_id", "side",
+                   "shares", "price", "kind", "exchange_id", "status", "filled_shares",
+                   "avg_price", "reason", "placed_ts", "settled_ts")
 
 
-def get_market(con: sqlite3.Connection, condition_id: str) -> sqlite3.Row | None:
-    return con.execute("SELECT * FROM markets WHERE condition_id=?", (condition_id,)).fetchone()
-
-
-def trader_trades(con: sqlite3.Connection, wallet: str, since_ts: int = 0,
-                  until_ts: int | None = None) -> list[sqlite3.Row]:
-    """One wallet's ingested trades, oldest first -- the replay's event source.
-
-    Ascending, unlike every API here, because a replay has to move forward through time. Hits
-    idx_trades_wallet_ts either way.
-    """
-    sql = "SELECT * FROM trades WHERE wallet=? AND ts>=?"
-    args: tuple = (wallet.lower(), since_ts)
-    if until_ts is not None:
-        sql += " AND ts<=?"
-        args += (until_ts,)
-    return con.execute(sql + " ORDER BY ts, id", args).fetchall()
-
-
-def settlement(con: sqlite3.Connection, token_id: str) -> sqlite3.Row | None:
-    """When a token's market resolved and whether this token was the winner.
-
-    Returns end_ts, resolved, and `won` as 1/0/NULL. `won` is NULL when the market resolved but
-    we never learned which outcome index this token is -- a state that must stay distinguishable
-    from a loss, because settling an unknown at zero would silently invent losses.
-    """
-    return con.execute(
-        """SELECT m.condition_id, m.end_ts, m.resolved, m.winning_index, a.outcome_index,
-                  CASE WHEN m.winning_index IS NULL OR a.outcome_index IS NULL THEN NULL
-                       WHEN m.winning_index = a.outcome_index THEN 1 ELSE 0 END AS won
-           FROM assets a JOIN markets m ON m.condition_id = a.condition_id
-           WHERE a.token_id = ?""",
-        (token_id,),
-    ).fetchone()
-
-
-def fee_source_split(con: sqlite3.Connection, run_id: int) -> dict:
-    """How much of a run's fee bill was computed from a market's own schedule versus guessed
-    from the category fallback. A backtest resting on guessed fees should say so."""
-    rows = con.execute(
-        """SELECT COALESCE(m.fee_source, 'unknown') AS src, COALESCE(SUM(o.fee), 0) AS fee
-           FROM orders o LEFT JOIN markets m ON m.condition_id = o.condition_id
-           WHERE o.run_id = ? GROUP BY src""",
-        (run_id,),
-    ).fetchall()
-    return {r["src"]: float(r["fee"]) for r in rows}
-
-
-def closed_positions_for(con: sqlite3.Connection, run_id: int) -> list[sqlite3.Row]:
-    return con.execute(
-        "SELECT * FROM positions WHERE run_id=? AND open=0 ORDER BY closed_ts, id", (run_id,)
-    ).fetchall()
-
-
-def reduce_position(con: sqlite3.Connection, position_id: int, fraction: float,
-                    proceeds_usd: float, exit_fee: float, reason: str,
-                    ts: int) -> tuple[float, int | None]:
-    """Sell part of an open position. Returns (realized_pnl_on_the_sold_part, kept_position_id).
-
-    A partial exit does not fit one `positions` row, because a row carries exactly one
-    `realized_pnl` and one `open` flag. Rather than bolt a second PnL column on, the row is
-    split: the original is shrunk to the portion being sold and closed against the proceeds,
-    and the remainder is written as a fresh open row carrying the same average price and the
-    original `opened_ts`.
-
-    Cost and fees are apportioned by the same fraction, so `avg_price` is unchanged on both
-    halves -- which matters because avg_price is what a stop-loss measures against, and a
-    partial exit must not silently move the stop.
-
-    Doing it this way keeps `run_cash` correct without touching it: the sold part's proceeds
-    arrive as a closed position's realized_pnl, and the kept part continues to tie up exactly
-    its own share of the cost. Booking the partial anywhere else would leave the proceeds
-    invisible to the cash calculation.
-
-    A `fraction` at or above 1 is a full exit and is handled by `close_position` instead.
-    """
-    if not 0.0 < fraction < 1.0:
-        raise ValueError(f"fraction must be strictly between 0 and 1, got {fraction}")
-    row = con.execute(
-        "SELECT * FROM positions WHERE id=? AND open=1", (position_id,)
-    ).fetchone()
-    if row is None:
-        raise KeyError(f"no open position {position_id}")
-
-    sold_shares = row["shares"] * fraction
-    sold_cost = row["cost_usd"] * fraction
-    sold_fees = row["fees_paid"] * fraction
-    keep_shares = row["shares"] - sold_shares
-    keep_cost = row["cost_usd"] - sold_cost
-    keep_fees = row["fees_paid"] - sold_fees
-
-    pnl = proceeds_usd - sold_cost - sold_fees - exit_fee
-    # Shrink the original to the sold portion and close it in one statement, so no other reader
-    # can ever observe a position whose size and open flag disagree.
-    con.execute(
-        """UPDATE positions
-           SET shares=?, cost_usd=?, fees_paid=?, open=0, closed_ts=?, close_reason=?,
-               realized_pnl=?
-           WHERE id=?""",
-        (sold_shares, sold_cost, sold_fees + exit_fee, ts, reason, pnl, position_id),
-    )
-    kept_id = None
-    if keep_shares > 0:
-        cur = con.execute(
-            """INSERT INTO positions
-                   (run_id, token_id, condition_id, shares, avg_price, cost_usd, fees_paid,
-                    opened_ts, open)
-               VALUES (?,?,?,?,?,?,?,?,1)""",
-            (row["run_id"], row["token_id"], row["condition_id"], keep_shares,
-             row["avg_price"], keep_cost, keep_fees, row["opened_ts"]),
-        )
-        kept_id = int(cur.lastrowid)
+def insert_resting(con: sqlite3.Connection, row: dict) -> int:
+    row.setdefault("placed_ts", int(time.time()))
+    row.setdefault("status", "open")
+    row.setdefault("filled_shares", 0.0)
+    for c in RESTING_COLUMNS:
+        row.setdefault(c, None)
+    cols = ",".join(RESTING_COLUMNS)
+    binds = ",".join(f":{c}" for c in RESTING_COLUMNS)
+    cur = con.execute(f"INSERT INTO resting_orders ({cols}) VALUES ({binds})", row)
     con.commit()
-    return pnl, kept_id
+    return int(cur.lastrowid)
 
 
-def last_trade_ts_by_condition(con: sqlite3.Connection) -> dict[str, int]:
-    """The last fill we ever observed in each market, as a proxy for when it stopped trading.
+def open_resting(con: sqlite3.Connection, run_id: int) -> list[sqlite3.Row]:
+    return con.execute(
+        "SELECT * FROM resting_orders WHERE run_id=? AND status='open' ORDER BY placed_ts",
+        (run_id,)).fetchall()
 
-    Needed because nothing in the data says when a market actually resolved. `markets.end_ts`
-    is gamma's *scheduled* end -- kickoff, or a nominal deadline -- and in-play markets trade
-    straight through it, so on some wallets more than half the fills land after it. Settling a
-    position at a timestamp earlier than the fill that opened it credits the outcome instantly,
-    which is look-ahead of the worst kind: the backtest learns who won before it has held the
-    position for a single second.
 
-    The last trade in a market is a lower bound on when it closed, and it is drawn from data we
-    already have. One scan of `trades` beats one query per position.
+def resting_for_position(con: sqlite3.Connection, position_id: int) -> list[sqlite3.Row]:
+    return con.execute(
+        "SELECT * FROM resting_orders WHERE position_id=? AND status='open'",
+        (position_id,)).fetchall()
+
+
+def settle_resting(con: sqlite3.Connection, resting_id: int, status: str,
+                   filled_shares: float = 0.0, avg_price: float | None = None,
+                   reason: str | None = None) -> None:
+    con.execute(
+        """UPDATE resting_orders
+           SET status=?, filled_shares=?, avg_price=?, reason=?, settled_ts=?
+           WHERE id=?""",
+        (status, filled_shares, avg_price, reason, int(time.time()), resting_id),
+    )
+    con.commit()
+
+
+def orphan_resting(con: sqlite3.Connection, mode: str = "live") -> list[sqlite3.Row]:
+    """Live orders still marked open on the book from a run that has already stopped.
+
+    A killed process leaves real orders resting on a real exchange. They are not a bug to be
+    hidden -- a take-profit that fills after the bot exits is the feature working -- but the
+    next run has to be told about them rather than discovering the shares are gone.
     """
-    return {r[0]: int(r[1]) for r in con.execute(
-        "SELECT condition_id, MAX(ts) FROM trades GROUP BY condition_id")}
+    return con.execute(
+        """SELECT r.* FROM resting_orders r JOIN task_runs t ON t.id = r.run_id
+           WHERE r.status='open' AND r.mode=? AND t.stopped_at IS NOT NULL
+           ORDER BY r.placed_ts""", (mode,)).fetchall()
 
 
-# --- Read models for the web console -------------------------------------------------------
-# Shaped for display rather than for the engine: each returns plain dicts, already joined, so
-# the HTTP layer never builds SQL of its own.
+def latency_samples(con: sqlite3.Connection, run_id: int | None = None) -> list[int]:
+    """seen_ts - trader_ts for every signal: how late we were, in seconds.
 
-
-def overview(con: sqlite3.Connection) -> dict:
-    q = lambda sql: con.execute(sql).fetchone()[0]  # noqa: E731
-    return {
-        "wallets": q("SELECT COUNT(*) FROM wallets"),
-        "screened": q("SELECT COUNT(*) FROM wallets WHERE selected=1"),
-        "scored": q("SELECT COUNT(*) FROM trader_scores"),
-        "markets": q("SELECT COUNT(*) FROM markets"),
-        "trades": q("SELECT COUNT(*) FROM trades"),
-        "tasks": q("SELECT COUNT(*) FROM tasks"),
-        "runs": q("SELECT COUNT(*) FROM task_runs"),
-        "open_positions": q("SELECT COUNT(*) FROM positions WHERE open=1"),
-        "newest_trade_ts": q("SELECT COALESCE(MAX(ts),0) FROM trades"),
-    }
-
-
-def ranked_traders(con: sqlite3.Connection, limit: int = 50) -> list[dict]:
-    rows = con.execute(
-        """SELECT ts.*, w.username, w.selected, w.screen_reason
-           FROM trader_scores ts LEFT JOIN wallets w ON w.address = ts.address
-           WHERE ts.rank_score IS NOT NULL
-           ORDER BY ts.rank_score DESC LIMIT ?""", (limit,)).fetchall()
-    return [dict(r) for r in rows]
-
-
-def task_overview(con: sqlite3.Connection) -> list[dict]:
-    """Every task with the state of its most recent run folded in."""
-    rows = con.execute(
-        """SELECT t.*,
-                  (SELECT r.id FROM task_runs r WHERE r.task=t.name
-                    ORDER BY r.started_at DESC LIMIT 1) AS last_run_id,
-                  (SELECT r.end_bankroll FROM task_runs r WHERE r.task=t.name
-                    ORDER BY r.started_at DESC LIMIT 1) AS last_end_bankroll,
-                  (SELECT r.stopped_at FROM task_runs r WHERE r.task=t.name
-                    ORDER BY r.started_at DESC LIMIT 1) AS last_stopped_at,
-                  (SELECT COUNT(*) FROM task_runs r WHERE r.task=t.name) AS run_count
-           FROM tasks t ORDER BY t.updated_at DESC""").fetchall()
-    return [dict(r) for r in rows]
-
-
-def run_overview(con: sqlite3.Connection, limit: int = 50, task: str | None = None
-                 ) -> list[dict]:
-    sql = """SELECT r.*, t.trader, t.slippage, t.fixed_usd, t.buy_method,
-                    (SELECT COUNT(*) FROM signals s WHERE s.run_id=r.id) AS signals,
-                    (SELECT COUNT(*) FROM signals s WHERE s.run_id=r.id AND s.action='copied')
-                        AS copied,
-                    (SELECT COUNT(*) FROM positions p WHERE p.run_id=r.id AND p.open=0)
-                        AS closed,
-                    (SELECT COALESCE(SUM(p.realized_pnl),0) FROM positions p
-                      WHERE p.run_id=r.id AND p.open=0) AS realized
-             FROM task_runs r LEFT JOIN tasks t ON t.name = r.task"""
+    This is measured, not assumed, and it is the number that decides whether copying a fast
+    trader is possible at all. Both columns have always been on `signals` for exactly this.
+    """
+    sql = "SELECT seen_ts - trader_ts FROM signals"
     args: tuple = ()
-    if task:
-        sql += " WHERE r.task=?"
-        args = (task,)
-    return [dict(x) for x in con.execute(sql + " ORDER BY r.started_at DESC, r.id DESC LIMIT ?",
-                                         args + (limit,))]
+    if run_id is not None:
+        sql += " WHERE run_id=?"
+        args = (run_id,)
+    return [int(r[0]) for r in con.execute(sql, args) if r[0] is not None]
 
 
-def run_detail(con: sqlite3.Connection, run_id: int, limit: int = 200) -> dict:
-    """Everything needed to audit one run: what we saw, what we did, what it cost."""
-    run = con.execute(
-        """SELECT r.*, t.trader, t.slippage, t.fixed_usd, t.max_concurrent, t.behavior
-           FROM task_runs r LEFT JOIN tasks t ON t.name=r.task WHERE r.id=?""",
-        (run_id,)).fetchone()
-    if run is None:
-        return {}
-    return {
-        "run": dict(run),
-        "summary": run_summary(con, run_id),
-        "skips": [{"reason": r, "count": n} for r, n in skip_reasons(con, run_id)],
-        "positions": [dict(r) for r in con.execute(
-            """SELECT p.*, m.question, m.slug FROM positions p
-               LEFT JOIN markets m ON m.condition_id = p.condition_id
-               WHERE p.run_id=? ORDER BY COALESCE(p.closed_ts, p.opened_ts) DESC LIMIT ?""",
-            (run_id, limit))],
-        "orders": [dict(r) for r in con.execute(
-            "SELECT * FROM orders WHERE run_id=? ORDER BY ts DESC, id DESC LIMIT ?",
-            (run_id, limit))],
-        "signals": [dict(r) for r in con.execute(
-            "SELECT * FROM signals WHERE run_id=? ORDER BY trader_ts DESC, id DESC LIMIT ?",
-            (run_id, limit))],
-    }
+def latency_stats(con: sqlite3.Connection, run_id: int | None = None) -> dict:
+    """Percentiles of copy latency. Nearest-rank, so p50 of an even sample is a real
+    observation rather than an average of two that never happened."""
+    xs = sorted(latency_samples(con, run_id))
+    if not xs:
+        return {"n": 0}
 
+    def pct(p: float) -> int:
+        return xs[min(len(xs) - 1, max(0, int(round(p / 100 * len(xs) + 0.5)) - 1))]
 
-def stored_scores(con: sqlite3.Connection) -> list[dict]:
-    """Every scored wallet's raw metrics, straight from `metrics_json`.
-
-    Lets a ranking be recomputed without refetching anything. The weights and the calibration
-    formula are judgement calls that get revised; the settled positions they are computed from
-    do not, so re-deriving a rank from stored metrics costs nothing and rescoring 900 wallets
-    over the network costs a quarter of an hour.
-    """
-    return [dict(r) for r in con.execute(
-        "SELECT * FROM trader_scores WHERE metrics_json IS NOT NULL")]
-
-
-def wallet_summary(con: sqlite3.Connection, address: str) -> dict:
-    address = address.lower()
-    w = con.execute("SELECT * FROM wallets WHERE address=?", (address,)).fetchone()
-    t = con.execute("SELECT COUNT(*) n, MIN(ts) a, MAX(ts) b FROM trades WHERE wallet=?",
-                    (address,)).fetchone()
-    return {
-        "wallet": dict(w) if w else None,
-        "score": dict(get_trader_score(con, address) or {}) or None,
-        "trades": t["n"], "first_ts": t["a"], "last_ts": t["b"],
-    }
+    return {"n": len(xs), "min": xs[0], "p50": pct(50), "p90": pct(90), "p99": pct(99),
+            "max": xs[-1], "mean": sum(xs) / len(xs)}

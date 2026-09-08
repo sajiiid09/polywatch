@@ -1,9 +1,15 @@
 [project]
 name = "polywatch"
 version = "0.0.1"
-description = "Read-only skill-vs-luck analytics for Polymarket wallets. Never trades."
+description = "Skill-vs-luck analytics for Polymarket wallets, and a copy-trading bot built on it."
 requires-python = ">=3.11"
 dependencies = []
+
+# Live trading only. Paper mode, ingestion and every analytic run on the standard library
+# alone, which is what keeps "does this program spend money" answerable by looking at whether
+# this extra is installed.
+[project.optional-dependencies]
+live = ["py-clob-client>=0.17"]
 
 [project.scripts]
 polywatch = "polywatch.cli:main"

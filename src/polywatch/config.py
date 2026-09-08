@@ -94,81 +94,59 @@ FEE_TYPE_CATEGORIES = ("geopolitics", "politics", "economics", "finance", "cultu
                        "mentions", "crypto", "sports", "tech", "world")
 
 
-# --- Backtest -----------------------------------------------------------------------------
-# The replay has no historical order books, so our fill price is the target's own fill price
-# worsened by a flat penalty. That one number stands in for both the book walk and copy
-# latency, which makes it the largest modelling assumption in the whole backtest -- so the CLI
-# sweeps it by default rather than quoting a single figure that hides it.
-BACKTEST_SLIPPAGE_SWEEP = (0.0, 0.03, 0.07)
+# --- Copy-trading engine ------------------------------------------------------------------
 
-# Ceiling on MIRROR sizing, as a fraction of bankroll. /value reports open positions only and
-# excludes idle cash, so the denominator is a floor on the target's account and every mirrored
-# fraction it produces is an overstatement. Without a cap, one trade by a wallet whose cash
-# sits idle would size to the whole bankroll.
-MIRROR_MAX_FRACTION = 0.10
+# Poll cadence for /activity. 15s, not 1s: data-api caches the activity feed, so polling faster
+# than the cache refreshes buys nothing but rate-limit risk and a bigger ingest_log. Whether
+# that is the right number is not assumed -- every signal stores seen_ts and trader_ts, and
+# `task report` prints the observed distribution of the difference. Tune this from that table,
+# not from this comment.
+POLL_INTERVAL_S = 15.0
+POLL_OVERLAP_S = 120        # how far back each poll re-reads, so a slow page cannot drop a fill
+POLL_TIMEOUT_S = 5.0        # a 30s socket timeout inside the loop would freeze the stop-loss
 
-# Stake per copied trade, as a fraction of bankroll. `stake x max_concurrent` is the share of
-# the account deployed at once, and it turned out to matter more than anything else the backtest
-# measures: at 2% x 5 slots (10% deployed) five of six screened wallets finished profitable even
-# at 7% slippage, while at 10% x 10 slots (fully deployed) four of the six were wiped out at
-# every slippage. A small bankroll dies of ruin long before it dies of a bad trader.
-DEFAULT_STAKE_FRACTION = 0.02
+# A quick-flip trader's edge decays in minutes. Copying a fill we noticed four minutes late is
+# not copying them, it is buying whatever they already moved. Signals older than this are
+# skipped and counted -- if most skips are 'stale' the poll interval is wrong, or the trader is
+# too fast to copy at all.
+MAX_SIGNAL_AGE_S = 120
 
-# Below this a position is dust: worth less than the fee to close it, and kept open it would
-# distort every open-position count the gates read.
-MIN_POSITION_USD = 0.01
+# Session bound. The bot is not meant to run unattended: stop-loss and trailing exits are
+# enforced by this process, so when it is not running they are not enforced either. A run ends
+# at this age and flattens whatever it is holding.
+SESSION_MAX_HOURS = 5.0
+FLATTEN_AT_SESSION_END = True
 
+# Exit ladder defaults, quick-flip shaped.
+DEFAULT_STOP_LOSS_PCT = 0.15      # off avg entry, after fees
+DEFAULT_TAKE_PROFIT_PCT = 0.10
+DEFAULT_TRAIL_PCT = 0.0           # 0 disables; 0.06 trails 6% off the high-water mark
+DEFAULT_MAX_HOLD_S = 2700         # 45 min. A quick flip that is still open after this failed.
+DEFAULT_MAX_CONCURRENT = 3
+DEFAULT_MAX_MARKET_USD = 25.0
 
-# --- Discovery funnel ---------------------------------------------------------------------
-# Four stages ordered by cost per wallet, so expensive evidence is only gathered for wallets
-# that survived the cheap evidence.
+# Run-level circuit breakers. Hit either and the run stops and flattens -- the point of a
+# 4-hour session is to be able to lose a bounded amount while not watching it.
+DEFAULT_MAX_DAILY_LOSS_USD = 20.0
+DEFAULT_MAX_DRAWDOWN_PCT = 0.25
 
-# Leaderboard pages per (category, period, ordering) combination. 11 x 4 x 2 x this many calls.
-# Two pages is 100 wallets per combination, which after dedupe is a candidate pool in the high
-# hundreds -- plenty, and still under 200 requests.
-SWEEP_PAGES_PER_COMBO = 2
+# Market-close guard. Liquidity thins and the book gaps as a market approaches resolution, so
+# entering here is how a quick flip turns into an unsellable position.
+MIN_SECONDS_TO_CLOSE = 900
+# Price band. Fees are proportional to min(p, 1-p), and the book is thinnest at the extremes.
+MIN_ENTRY_PRICE = 0.05
+MAX_ENTRY_PRICE = 0.95
 
-# Walk-forward split. Wallets are RANKED on [now - RANK_WINDOW_DAYS, now - VALIDATION_DAYS] and
-# then VALIDATED on the unseen days since. Ranking a wallet on the same history you judge it by
-# is curve fitting, and the whole point of the split is that the second number was never
-# available to the first.
-RANK_WINDOW_DAYS = 60
-VALIDATION_DAYS = 7
+# Live trading. Read from the environment, never stored in the database or a config file.
+ENV_PRIVATE_KEY = "POLYMARKET_PRIVATE_KEY"
+ENV_FUNDER = "POLYMARKET_FUNDER"        # the proxy/funder address that holds the USDC
+ENV_API_CREDS = ("POLYMARKET_API_KEY", "POLYMARKET_API_SECRET", "POLYMARKET_API_PASSPHRASE")
+CLOB_CHAIN_ID = 137                      # Polygon mainnet
 
-# A wallet must have traded this recently to be worth copying at all. Two days rather than the
-# screen's usual seven: a wallet that last traded six days ago may simply have stopped, and
-# copying silence produces no trades and no information.
-MAX_RECENCY_DAYS_ACTIVE = 2.0
-
-# Below this many settled positions before the cutoff, the metrics are noise. skill.brier makes
-# the same point: a Brier over four markets means nothing.
-MIN_SETTLED_FOR_RANK = 30
-
-# Pre-cutoff settled positions to gather before paging stops. /closed-positions is newest
-# first, so a prolific wallet's first pages sit entirely inside the validation window and are
-# filtered away by the cutoff -- paging has to continue until enough OLD positions are in hand,
-# and a flat page cap would silently score those wallets on almost nothing. Well above
-# MIN_SETTLED_FOR_RANK so the metrics are stable, well below the 1,000-row ceiling so a deep
-# history does not cost twenty requests.
-RANK_SAMPLE_TARGET = 200
-
-# Parallel fetchers for the scoring stage. Shares one global rate limiter, so this raises
-# throughput without raising the request rate.
-RANK_WORKERS = 4
-
-# How many top-ranked wallets get the expensive walk-forward treatment.
-FINALIST_COUNT = 15
-
-# rank_score weights. Explicit rather than tuned: every one of these is a claim about what
-# makes a trader copyable, and a reader should be able to disagree with a specific number.
-RANK_WEIGHTS = {
-    "calibration": 0.30,   # 1 - brier/0.25; the only metric measuring judgement not outcome
-    "consistency": 0.25,   # share of months in profit; small wins over time beat one big score
-    "roi": 0.20,           # return per dollar deployed, which is what copying reproduces
-    "drawdown": 0.15,      # 1 - max_drawdown; a bad number here is damning
-    "evidence": 0.10,      # min(n_closed/100, 1); stops a short record outranking a long one
-}
-
-# Brier score of forecasting 0.5 on everything. At or above it the entry prices carry no
-# information whatever the PnL says, so calibration scores zero rather than merely poorly.
-BRIER_COINFLIP = 0.25
+# Fee floor. A round trip costs 2 * rate * min(p, 1-p) / p of the stake -- 10% at even odds in
+# a 5% category, under 1% near the extremes -- so a percentage take-profit under that number
+# cannot be reached profitably however the trade goes. MIN_EDGE is the margin demanded on top
+# of the floor; MAX_FEE_FRAC refuses the entry outright when the fee alone would eat this much
+# of the stake, which no exit rule can undo.
+DEFAULT_MIN_EDGE = 0.02
+DEFAULT_MAX_FEE_FRAC = 0.12

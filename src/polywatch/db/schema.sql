@@ -259,3 +259,31 @@ CREATE TABLE IF NOT EXISTS market_meta (
     end_ts            INTEGER,
     fetched_at        INTEGER NOT NULL
 );
+
+-- Resting exit orders. Polymarket's book takes a GTC limit order and holds it until it fills or
+-- is cancelled, which is exactly the "sell my shares automatically at 0.62" behaviour the UI
+-- exposes -- so a take-profit does not need the bot to be alive to fire. A stop-loss does: the
+-- exchange has no stop order type, so a stop is a price the bot watches and a market sell it
+-- sends, and it is unenforced whenever the process is not running. That asymmetry is the reason
+-- this table exists rather than the exit ladder being held in memory: a TP posted live outlives
+-- the session and must be findable (and cancellable) by the next one.
+CREATE TABLE IF NOT EXISTS resting_orders (
+    id            INTEGER PRIMARY KEY,
+    run_id        INTEGER NOT NULL REFERENCES task_runs(id),
+    position_id   INTEGER REFERENCES positions(id),
+    mode          TEXT NOT NULL,            -- 'paper' | 'live'
+    token_id      TEXT NOT NULL,
+    condition_id  TEXT NOT NULL,
+    side          TEXT NOT NULL,            -- always SELL today; BUY kept open for maker entries
+    shares        REAL NOT NULL,
+    price         REAL NOT NULL,            -- the resting limit, on-tick
+    kind          TEXT NOT NULL,            -- 'take_profit' | 'manual'
+    exchange_id   TEXT,                     -- the CLOB's order id, live mode only
+    status        TEXT NOT NULL,            -- 'open' | 'filled' | 'cancelled' | 'rejected'
+    filled_shares REAL NOT NULL DEFAULT 0,
+    avg_price     REAL,
+    reason        TEXT,
+    placed_ts     INTEGER NOT NULL,
+    settled_ts    INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_resting_run_status ON resting_orders(run_id, status);

@@ -1,130 +1,217 @@
-"""The Task dataclass that `schema.sql` has been promising since Phase 1.
+"""A task: one trader, one bankroll, one set of rules for copying them.
 
-One task is one standing instruction: copy this wallet, this way, with this much money. It is
-the same object whether it drives a historical replay, a live paper run or (eventually) a live
-one -- only the fill source changes underneath it. That is deliberate: a backtest that used
-different rules from the thing it was meant to validate would be measuring the wrong program.
+Persisted whole into `tasks.config_json`; the individual columns beside it are a denormalised
+copy so that `task list` and ad-hoc SQL do not have to parse JSON. `config_json` is the source
+of truth on read -- new knobs are added here and appear in old databases as their defaults,
+which is why the engine never grew a schema migration for each new rule.
 
-`config_json` in the tasks table is this dataclass serialised whole; the sibling columns are
-denormalised copies so `task list` and ad-hoc SQL never have to parse JSON.
+The defaults are shaped for the quick-flip pattern, because that is the pattern a copier can
+actually capture: a trade held for twenty minutes is still there when we see it fifteen seconds
+late, whereas a multi-day thesis position is not copied so much as joined at a worse price
+after the move. Long-hold ideas are better handled as suggestions to act on by hand -- see
+`hold='hours'`, which loosens the exits but is not what the poller is tuned for.
 """
 
 from __future__ import annotations
 
 import json
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, field, fields
 
-from ..config import DEFAULT_BANKROLL_USD, DEFAULT_SLIPPAGE
-
-MODES = ("paper", "live")
-BUY_METHODS = ("fixed", "mirror")
-BEHAVIORS = ("buys", "buys_sells")
-RISKS = ("conservative", "moderate")
-STYLES = ("safe_and_steady", "value_hunter", "momentum")
-HOLDS = ("quick_flips", "hours")
-ACTIVITIES = ("casual", "active")
-EXIT_KINDS = ("pct", "price")
-
-# Price bands per style. A style is a claim about *where in the probability range* the edge is,
-# and enforcing it as an entry filter is the only way the setting means anything -- otherwise
-# it is a label on a run that behaved identically to every other run.
-#   safe_and_steady  favourites; small edges, high hit rate, and the cheapest fees
-#   value_hunter     underdogs; the tail the favourites-buyers are selling
-#   momentum         anything liquid enough to move
-STYLE_BANDS = {
-    "safe_and_steady": (0.60, 0.97),
-    "value_hunter": (0.03, 0.40),
-    "momentum": (0.02, 0.98),
-}
-
-# Risk caps the entry price on top of the style band. `conservative` refuses the far tails in
-# both directions: a 0.02 lottery ticket and a 0.98 near-certainty are opposite trades but both
-# are bets the fee schedule and the resolution risk make bad at a $100 bankroll.
-RISK_BANDS = {
-    "conservative": (0.10, 0.92),
-    "moderate": (0.01, 0.99),
-}
+from . import book as bk
+from ..config import (DEFAULT_BANKROLL_USD, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_DAILY_LOSS_USD,
+                      DEFAULT_MAX_DRAWDOWN_PCT, DEFAULT_MAX_FEE_FRAC, DEFAULT_MAX_HOLD_S,
+                      DEFAULT_MAX_MARKET_USD, DEFAULT_MIN_EDGE,
+                      DEFAULT_SLIPPAGE, DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT,
+                      DEFAULT_TRAIL_PCT, MAX_ENTRY_PRICE, MAX_SIGNAL_AGE_S, MIN_ENTRY_PRICE,
+                      MIN_SECONDS_TO_CLOSE, POLL_INTERVAL_S, SESSION_MAX_HOURS)
 
 
 @dataclass
 class Task:
     name: str
     trader: str
-    mode: str = "paper"
+    mode: str = "paper"                     # 'paper' | 'live'
     bankroll: float = DEFAULT_BANKROLL_USD
-    buy_method: str = "fixed"
-    fixed_usd: float | None = 10.0
-    max_market_usd: float = 25.0
-    max_concurrent: int = 10
+
+    # --- sizing -------------------------------------------------------------------------
+    buy_method: str = "fixed"               # 'fixed' | 'mirror'
+    fixed_usd: float = 10.0
+    # MIRROR: their stake as a fraction of their account, applied to ours. Capped, because a
+    # trader who bets 40% of their book on one market is not someone to mirror proportionally.
+    mirror_max_frac: float = 0.10
+    max_market_usd: float = DEFAULT_MAX_MARKET_USD
+    max_concurrent: int = DEFAULT_MAX_CONCURRENT
     slippage: float = DEFAULT_SLIPPAGE
-    sl_kind: str | None = None
-    sl_value: float | None = None
-    tp_kind: str | None = None
-    tp_value: float | None = None
+
+    # --- exits --------------------------------------------------------------------------
+    # sl_kind/tp_kind: 'pct' measures off the average entry price, 'price' is an absolute
+    # 0..1 level, None disables the rung.
+    sl_kind: str | None = "pct"
+    sl_value: float | None = DEFAULT_STOP_LOSS_PCT
+    tp_kind: str | None = "pct"
+    tp_value: float | None = DEFAULT_TAKE_PROFIT_PCT
+    # A percentage take-profit is meaningless until it clears both taker fees, and what it has
+    # to clear depends on the entry price: a round trip costs 10% of stake at 0.50 and 1% at
+    # 0.90. `tp_fee_policy` says what to do when the configured target is under that floor.
+    #   'widen' -- raise the target to the floor plus `min_edge`. The default: the trade is
+    #             still worth taking, it just cannot be exited at the price we asked for.
+    #   'skip'  -- refuse the trade, counted as `fee_floor`. Use when the target is a thesis
+    #             about how far the price moves, not an arbitrary number.
+    #   'off'   -- leave the target where it was set. Only sane with follow_exit on.
+    tp_fee_policy: str = "widen"
+    min_edge: float = DEFAULT_MIN_EDGE      # margin over the fee floor, in price fraction
+    # Refuse any entry whose round-trip fee exceeds this share of the stake, whatever the
+    # target. Near 0.50 in a 7% category the fee alone is 14% of stake, and no exit rule
+    # recovers that.
+    max_fee_frac: float = DEFAULT_MAX_FEE_FRAC
+    trail_pct: float = DEFAULT_TRAIL_PCT    # 0 disables
+    max_hold_s: int = DEFAULT_MAX_HOLD_S
+    # Post the take-profit as a resting GTC limit sell on the exchange instead of watching for
+    # the price and selling at market. This is the one exit that survives the bot being closed.
+    resting_tp: bool = True
+    # Sell when the trader sells. The whole reason to copy a quick-flip trader is that they
+    # know when to get out; the exit ladder is a floor under that, not a replacement for it.
+    follow_exit: bool = True
+
+    # --- gates --------------------------------------------------------------------------
+    max_signal_age_s: int = MAX_SIGNAL_AGE_S
+    min_price: float = MIN_ENTRY_PRICE
+    max_price: float = MAX_ENTRY_PRICE
+    min_seconds_to_close: int = MIN_SECONDS_TO_CLOSE
+    min_trade_usd: float = 0.0              # ignore the trader's own dust
+
+    # --- run bounds ---------------------------------------------------------------------
+    poll_interval_s: float = POLL_INTERVAL_S
+    session_hours: float = SESSION_MAX_HOURS
+    max_daily_loss_usd: float = DEFAULT_MAX_DAILY_LOSS_USD
+    max_drawdown_pct: float = DEFAULT_MAX_DRAWDOWN_PCT
+    flatten_on_stop: bool = True
+
+    # --- persona, carried for discovery and reporting only ------------------------------
     behavior: str = "buys_sells"
-    risk: str = "moderate"
+    risk: str = "conservative"
     category: str | None = None
     style: str = "momentum"
-    hold: str = "hours"
+    hold: str = "quick_flips"
     activity: str = "active"
-    created_at: int | None = None
-    updated_at: int | None = None
 
-    def __post_init__(self):
+    notes: str = ""
+
+    def __post_init__(self) -> None:
         self.trader = self.trader.lower()
-        _one_of("mode", self.mode, MODES)
-        _one_of("buy_method", self.buy_method, BUY_METHODS)
-        _one_of("behavior", self.behavior, BEHAVIORS)
-        _one_of("risk", self.risk, RISKS)
-        _one_of("style", self.style, STYLES)
-        _one_of("hold", self.hold, HOLDS)
-        _one_of("activity", self.activity, ACTIVITIES)
-        for name in ("sl_kind", "tp_kind"):
-            val = getattr(self, name)
-            if val is not None:
-                _one_of(name, val, EXIT_KINDS)
-        if self.bankroll <= 0:
-            raise ValueError(f"bankroll must be positive, got {self.bankroll}")
-        if not 0.0 <= self.slippage < 1.0:
-            raise ValueError(f"slippage must be in [0, 1), got {self.slippage}")
-        if self.max_market_usd <= 0:
-            raise ValueError(f"max_market_usd must be positive, got {self.max_market_usd}")
-        if self.max_concurrent < 1:
-            raise ValueError(f"max_concurrent must be at least 1, got {self.max_concurrent}")
-        if self.buy_method == "fixed" and not (self.fixed_usd and self.fixed_usd > 0):
-            raise ValueError("buy_method='fixed' needs a positive fixed_usd")
+        if self.mode not in ("paper", "live"):
+            raise ValueError(f"mode must be paper or live, got {self.mode!r}")
+        if self.buy_method not in ("fixed", "mirror"):
+            raise ValueError(f"buy_method must be fixed or mirror, got {self.buy_method!r}")
+        if self.tp_fee_policy not in ("widen", "skip", "off"):
+            raise ValueError(f"tp_fee_policy must be widen, skip or off, "
+                             f"got {self.tp_fee_policy!r}")
+        for kind_attr in ("sl_kind", "tp_kind"):
+            k = getattr(self, kind_attr)
+            if k not in (None, "pct", "price"):
+                raise ValueError(f"{kind_attr} must be pct, price or None, got {k!r}")
+        if not 0 <= self.slippage < 1:
+            raise ValueError("slippage is a fraction, 0..1")
+        if self.min_price >= self.max_price:
+            raise ValueError("min_price must be below max_price")
 
-    # --- price bands ----------------------------------------------------------------------
+    # --- persistence --------------------------------------------------------------------
 
-    def price_band(self) -> tuple[float, float]:
-        """The intersection of the style band and the risk band.
-
-        Intersected rather than layered so that an impossible combination surfaces as an empty
-        band -- and therefore as every signal skipped with a named reason -- instead of one
-        setting silently winning over the other.
-        """
-        s_lo, s_hi = STYLE_BANDS[self.style]
-        r_lo, r_hi = RISK_BANDS[self.risk]
-        return max(s_lo, r_lo), min(s_hi, r_hi)
-
-    # --- persistence ----------------------------------------------------------------------
-
-    def to_row(self) -> dict:
-        row = asdict(self)
-        row["config_json"] = json.dumps(asdict(self), sort_keys=True)
-        # store.upsert_task stamps these with setdefault, which a present-but-None key defeats.
-        # Dropping them is what lets the database own the clock for a task's own metadata.
-        for key in ("created_at", "updated_at"):
-            if row.get(key) is None:
-                row.pop(key)
+    def as_row(self) -> dict:
+        """The `tasks` row: the denormalised columns plus the whole config as JSON."""
+        d = asdict(self)
+        row = {c: d.get(c) for c in (
+            "name", "trader", "mode", "bankroll", "buy_method", "fixed_usd", "max_market_usd",
+            "max_concurrent", "slippage", "sl_kind", "sl_value", "tp_kind", "tp_value",
+            "behavior", "risk", "category", "style", "hold", "activity")}
+        row["config_json"] = json.dumps(d, sort_keys=True)
         return row
 
     @classmethod
     def from_row(cls, row) -> "Task":
-        names = {f.name for f in fields(cls)}
-        return cls(**{k: row[k] for k in row.keys() if k in names})
+        """Rebuild from a `tasks` row, tolerating a config written by an older version.
+
+        Unknown keys are dropped and missing ones fall back to the dataclass default, so adding
+        a knob here never invalidates a saved task.
+        """
+        cfg = json.loads(row["config_json"]) if row["config_json"] else {}
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in cfg.items() if k in known})
+
+    # --- derived ------------------------------------------------------------------------
+
+    def stake_usd(self, trader_usd: float, trader_account_usd: float) -> float:
+        """What to spend copying a trade of `trader_usd` by an account worth
+        `trader_account_usd`.
+
+        FIXED ignores both and bets the same amount every time. MIRROR scales their conviction
+        onto our bankroll: the fraction of their account they just risked, times ours, capped at
+        `mirror_max_frac`. The cap matters more than the ratio -- /value reports open positions
+        only, so it understates their account and therefore overstates the fraction.
+        """
+        if self.buy_method == "fixed":
+            usd = self.fixed_usd
+        else:
+            frac = (trader_usd / trader_account_usd) if trader_account_usd > 0 else 0.0
+            usd = min(frac, self.mirror_max_frac) * self.bankroll
+        return min(usd, self.max_market_usd)
+
+    def stop_price(self, avg_price: float) -> float | None:
+        if self.sl_kind is None or self.sl_value is None:
+            return None
+        return avg_price * (1 - self.sl_value) if self.sl_kind == "pct" else self.sl_value
+
+    def target_price(self, avg_price: float, fee_rate: float | None = None) -> float | None:
+        """The take-profit level, raised to clear both fees when it has to be.
+
+        An absolute ('price') target is returned as given -- it is a statement about where the
+        market is going, and moving it would be answering a different question. A percentage
+        target is relative to our own entry, so widening it to the fee floor keeps it meaning
+        what it was meant to mean: the smallest win worth taking.
+        """
+        if self.tp_kind is None or self.tp_value is None:
+            return None
+        if self.tp_kind == "price":
+            return self.tp_value
+        pct = self.tp_value
+        if fee_rate is not None and self.tp_fee_policy == "widen":
+            pct = max(pct, bk.min_viable_target(avg_price, fee_rate, self.min_edge))
+        return avg_price * (1 + pct)
+
+    def target_is_viable(self, price: float, fee_rate: float) -> bool:
+        """Can the configured percentage target clear the round trip at this price?"""
+        if self.tp_kind != "pct" or self.tp_value is None:
+            return True
+        return self.tp_value >= bk.min_viable_target(price, fee_rate, self.min_edge) - 1e-9
 
 
-def _one_of(name: str, value, allowed: tuple) -> None:
-    if value not in allowed:
-        raise ValueError(f"{name} must be one of {allowed}, got {value!r}")
+# No take-profit, deliberately. Measured on 374 matched round trips from a live quick-flip
+# wallet on 2026-09-08: their flips returned a median of +15% but a p75 of +68% and a p90 of
+# +194%, and a fixed target truncates exactly the tail that pays for the losers. Simulated over
+# 30k fifteen-minute windows at $10 a copy, an +8% target returned -$0.68 a session and a target
+# widened to clear the fees still returned -$0.57, while following the trader out of the
+# position returned +$6.59. The trader's own exit is the edge being copied; a target is a
+# different, worse strategy wearing the same clothes.
+#
+# The floor under that is the stop, the trailing stop and the time stop, all of which need this
+# process running. Set --take-profit to get a resting GTC sell instead: it caps the upside, and
+# it is the right trade when the alternative is leaving the position unwatched.
+QUICK_FLIP = dict(hold="quick_flips", max_hold_s=2700, max_signal_age_s=120,
+                  poll_interval_s=15.0, trail_pct=0.06, follow_exit=True,
+                  tp_kind=None, tp_value=None)
+
+# Looser everything: a position meant to be held for hours cannot have a 45-minute time stop or
+# a 6% trailing exit, and following the trader out matters less when their exit is a day away.
+# This preset exists so the same machinery can babysit a manual idea, not because the poller is
+# any good at finding one.
+SLOW_HOLD = dict(hold="hours", max_hold_s=6 * 3600, max_signal_age_s=900,
+                 poll_interval_s=30.0, trail_pct=0.0, sl_value=0.25,
+                 tp_kind="pct", tp_value=0.30)
+
+PRESETS = {"quick_flips": QUICK_FLIP, "hours": SLOW_HOLD}
+
+
+def preset(name: str, **overrides) -> dict:
+    if name not in PRESETS:
+        raise ValueError(f"unknown preset {name!r}; have {sorted(PRESETS)}")
+    return {**PRESETS[name], **overrides}
