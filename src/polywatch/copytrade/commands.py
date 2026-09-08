@@ -14,7 +14,7 @@ from ..config import ENV_FUNDER, ENV_PRIVATE_KEY, MAX_RPS, POLL_TIMEOUT_S
 from ..db import store
 from ..fetch.client import Client
 from . import book as bk
-from . import execution, report
+from . import execution, report, stream
 from .engine import Engine, ReconcileError
 from .task import PRESETS, Task, preset
 
@@ -224,7 +224,17 @@ def _run(con, args) -> int:
     # stall inside the loop is a 30-second window with no stop-loss.
     client = Client(con=con, rps=MAX_RPS, dump_raw=False, log_ok=False,
                     timeout=POLL_TIMEOUT_S)
-    eng = Engine(con, t, ex, client)
+
+    # A live book feed if the optional extra is installed. It starts with no subscriptions --
+    # a run holds nothing yet -- and picks up each token as a position opens in it.
+    feed = None
+    if not args.no_stream:
+        feed = stream.connect([], log=print)
+        if feed is None and stream_requested(args):
+            print("  book streaming needs the optional extra: "
+                  "uv pip install 'polywatch[stream]'")
+
+    eng = Engine(con, t, ex, client, stream=feed)
     try:
         summary = eng.run()
     except ReconcileError as e:
@@ -236,9 +246,17 @@ def _run(con, args) -> int:
             print()
             print(report.run_report(con, last["id"], t))
         return 1
+    finally:
+        if feed is not None:
+            feed.stop()
     print()
     print(report.run_report(con, summary["run_id"], t))
     return 0
+
+
+def stream_requested(args) -> bool:
+    """Did the operator ask for streaming explicitly? Only then is its absence worth a line."""
+    return bool(getattr(args, "stream", False))
 
 
 def _report(con, args) -> int:

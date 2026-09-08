@@ -112,5 +112,7 @@ too — `fee_source` exists as a column precisely so a guess is visible downstre
 - Record decisions in `docs/decisions/` as short ADRs. Update `STRATEGY.md` / `RULES.md` in the
   same commit when a decision changes them.
 - Prefer editing an existing module to adding one. This codebase is small on purpose.
-- Do not add a dependency without a reason that survives `RULES.md` I5. Optional extras (`live`,
-  `stream`) exist so the core stays standard-library-only.
+- Do not add a dependency without a reason that survives `RULES.md` I5. Optional extras exist so
+  the core stays standard-library-only: `live` (`py-clob-client`) is what makes the program able
+  to spend money, and `stream` (`websocket-client`) only ever reads, which is why they are
+  separate — installing `stream` says nothing about whether this program can trade.

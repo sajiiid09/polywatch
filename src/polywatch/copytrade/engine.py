@@ -25,10 +25,11 @@ from __future__ import annotations
 
 import signal as _signal
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 from ..config import (ACTIVITY_PAGE, MAX_ACTIVITY_PAGES, MIN_ORDER_SHARES_FALLBACK,
-                      POLL_OVERLAP_S, TICK_SIZE_FALLBACK)
+                      POLL_OVERLAP_S, POLL_TIMEOUT_S, TICK_SIZE_FALLBACK)
 from ..db import store
 from ..fetch import polymarket as api
 from ..fetch.client import Client, FetchError
@@ -73,6 +74,11 @@ class RunState:
     high_water: dict[int, float] = field(default_factory=dict)
     trader_account_usd: dict[str, float] = field(default_factory=dict)
     dropped: dict[str, str] = field(default_factory=dict)
+    # Marks computed by the last sweep of manage_positions, and the tick they belong to. The
+    # circuit breakers need exactly the numbers that sweep just produced; refetching every
+    # position's book to recompute them doubled the request count of every tick.
+    marks: dict[int, float] = field(default_factory=dict)
+    marks_tick: int = -1
     polls: int = 0
     errors: int = 0
     adopted: int = 0
@@ -82,15 +88,19 @@ class RunState:
 
 class Engine:
     def __init__(self, con, task: Task, executor: Executor, client: Client,
-                 log=print, now=lambda: int(time.time())):
+                 log=print, now=lambda: int(time.time()), stream=None, workers: int = 4):
         self.con = con
         self.task = task
         self.ex = executor
         self.client = client
         self.log = log
         self.now = now
+        # A live book feed, or None to fetch every book over HTTP. See copytrade/stream.py.
+        self.stream = stream
+        self.workers = workers
         self.state: RunState | None = None
         self._stopping = False
+        self._workers_client: Client | None = None
 
     # --- market metadata ----------------------------------------------------------------
 
@@ -135,11 +145,72 @@ class Engine:
         return bk.fee_rate_for(meta.get("category_derived"), meta.get("fee_rate"))
 
     def book(self, token_id: str) -> dict | None:
+        """The current book for one token: from the stream when it is live, else fetched."""
+        if self.stream is not None:
+            cached = self.stream.book(token_id)
+            if cached is not None:
+                return cached
         try:
             return records.parse_book(api.book(self.client, token_id, dump_raw=False))
         except FetchError as e:
             self.log(f"  ! book {token_id[:12]}: {e}")
             return None
+
+    def books(self, token_ids: list[str]) -> dict[str, dict]:
+        """Several books at once. Streamed ones are free; the rest are fetched in parallel.
+
+        The rate limiter is shared and global, so this does not issue requests any faster than
+        the serial version was allowed to -- it just stops each one waiting on the last one's
+        round trip before it starts.
+        """
+        out: dict[str, dict] = {}
+        todo: list[str] = []
+        for tok in dict.fromkeys(token_ids):
+            cached = self.stream.book(tok) if self.stream is not None else None
+            if cached is not None:
+                out[tok] = cached
+            else:
+                todo.append(tok)
+        if not todo:
+            return out
+        if len(todo) == 1 or self.workers <= 1:
+            for tok in todo:
+                b = self.book(tok)
+                if b is not None:
+                    out[tok] = b
+            return out
+
+        client = self._worker_client()
+
+        def fetch(token_id: str):
+            try:
+                return token_id, records.parse_book(
+                    api.book(client, token_id, dump_raw=False)), None
+            except FetchError as e:
+                return token_id, None, str(e)
+
+        with ThreadPoolExecutor(max_workers=min(self.workers, len(todo))) as pool:
+            for token_id, book, err in pool.map(fetch, todo):
+                if err:
+                    self.log(f"  ! book {token_id[:12]}: {err}")
+                elif book is not None:
+                    out[token_id] = book
+        return out
+
+    def _worker_client(self) -> Client:
+        """A Client for worker threads: shares the rate limiter, never touches SQLite.
+
+        The connection belongs to the main thread. Workers that logged to it would be writing to
+        sqlite from a thread that does not own it, which is the kind of bug that shows up once a
+        week in production and never in a test.
+        """
+        if self._workers_client is None:
+            src = self.client
+            self._workers_client = Client(
+                con=None, dump_raw=False, log_ok=False, buffer_logs=True,
+                limiter=getattr(src, "limiter", None),
+                timeout=getattr(src, "timeout", POLL_TIMEOUT_S))
+        return self._workers_client
 
     # --- the loop -----------------------------------------------------------------------
 
@@ -244,6 +315,8 @@ class Engine:
             f"follow trader's exits: {'yes' if t.follow_exit else 'no'}",
             f"  breakers      -${t.max_daily_loss_usd:,.2f} or -{t.max_drawdown_pct:.0%}",
             "",
+            f"  exits         checked {'on every book update (streamed)' if self.stream is not None and self.stream.live else f'once every {t.poll_interval_s:.0f}s (polled)'}",
+            "",
             "  The stop-loss is enforced by this process. The exchange has no stop order type,",
             "  so while the bot is not running, the stop is not running. The take-profit, if it",
             "  is a resting order, does not depend on the bot at all.",
@@ -281,7 +354,7 @@ class Engine:
                     break
                 nap = t.poll_interval_s - (time.monotonic() - tick)
                 if nap > 0:
-                    time.sleep(nap)
+                    self._wait(nap)
         except ReconcileError:
             # Already logged, and `reconcile` closed the run row. Deliberately not routed through
             # `stop()`: flattening means selling, and selling is the thing we have just decided
@@ -290,6 +363,36 @@ class Engine:
         except KeyboardInterrupt:
             s.stop_reason = "interrupted"
         return self.stop(s.stop_reason or "stopped")
+
+    def _wait(self, seconds: float) -> None:
+        """Wait for the next poll -- re-checking the exits every time the book moves.
+
+        Without a stream this is a sleep, and the exit ladder runs once per poll interval. Since
+        the stop-loss, the trailing stop and the time stop are enforced by this process and by
+        nothing else, that interval is the resolution of every protection the run has: a
+        fifteen-second gap in a market that moves in seconds is a fifteen-second option written
+        against us for free.
+
+        With a stream, the wait ends early whenever a held book changes, the ladder runs, and
+        the wait resumes for whatever is left of the interval. Signals are still gathered on the
+        poll tick, because a third party's fills cannot be streamed at all.
+        """
+        if self.stream is None or not self.stream.live:
+            time.sleep(seconds)
+            return
+        deadline = time.monotonic() + seconds
+        while not self._stopping:
+            left = deadline - time.monotonic()
+            if left <= 0:
+                return
+            if not self.stream.changed.wait(timeout=left):
+                return
+            self.stream.changed.clear()
+            try:
+                self.manage_positions()
+            except FetchError as e:
+                self.state.errors += 1
+                self.log(f"  ! exit check failed: {e}")
 
     def _install_signal_handlers(self) -> None:
         """SIGINT/SIGTERM set a flag rather than raising through the middle of a fill.
@@ -589,6 +692,8 @@ class Engine:
             # no longer exists. Replaced rather than left, or the stop and the target end up
             # measured from different entries.
             self.cancel_resting(pos_id, "reprice")
+        if self.stream is not None:
+            self.stream.watch([ev["token_id"]])
         pos = self.con.execute("SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
         self.log(f"  + buy {fill.shares:.1f} @ {fill.avg_price:.3f} "
                  f"(${fill.cost:.2f} + ${fill.fee:.2f} fee)  {ev.get('title') or ''}"[:110])
@@ -705,9 +810,19 @@ class Engine:
     # --- position management ------------------------------------------------------------
 
     def manage_positions(self) -> None:
+        """Walk the open book once: check resting orders, then the exit ladder.
+
+        The books are fetched together rather than one after another. Every request is a round
+        trip under a global rate limit, so a serial sweep makes the tick -- and therefore the
+        interval between stop-loss checks -- grow with the number of positions held. That is
+        exactly backwards: the more exposure a run has, the faster it should be looking at it.
+        """
         s, t = self.state, self.task
-        for pos in store.open_positions(self.con, s.run_id):
-            book = self.book(pos["token_id"])
+        positions = store.open_positions(self.con, s.run_id)
+        books = self.books([p["token_id"] for p in positions])
+        marks: dict[int, float] = {}
+        for pos in positions:
+            book = books.get(pos["token_id"])
             if book is None:
                 continue
             meta = self.market_meta(pos["condition_id"])
@@ -719,11 +834,15 @@ class Engine:
             m = exits.mark(pos, book, rate)
             if m.net_price is not None:
                 s.high_water[pos["id"]] = max(s.high_water.get(pos["id"], 0.0), m.net_price)
+            if m.pnl is not None:
+                marks[pos["id"]] = m.pnl
             d = exits.check(t, pos, book, fee_rate=rate, now=self.now(),
                             high_water=s.high_water.get(pos["id"]))
             if d.exit:
                 self.log(f"  exit {pos['token_id'][:10]}: {d.reason} -- {d.detail}")
                 self.close(pos, d.reason)
+                marks.pop(pos["id"], None)
+        s.marks, s.marks_tick = marks, s.polls
 
     def check_resting(self, pos, book: dict, rate: float) -> bool:
         """Did a resting take-profit fill? Returns True when the position is now closed.
@@ -748,10 +867,21 @@ class Engine:
         return False
 
     def unrealized(self) -> float:
-        """Mark every open position to the bid side, after fees. Used by the breakers."""
+        """Mark every open position to the bid side, after fees. Used by the breakers.
+
+        Reuses the marks `manage_positions` computed on this same tick. They are the same books
+        and the same arithmetic, so fetching them again cost a second round trip per position to
+        arrive at a number we already had -- and delayed the breaker check by exactly that long.
+        """
+        s = self.state
+        positions = store.open_positions(self.con, s.run_id)
+        if s.marks_tick == s.polls:
+            return sum(s.marks.get(p["id"], 0.0) for p in positions)
+
         total = 0.0
-        for pos in store.open_positions(self.con, self.state.run_id):
-            book = self.book(pos["token_id"])
+        books = self.books([p["token_id"] for p in positions])
+        for pos in positions:
+            book = books.get(pos["token_id"])
             if book is None:
                 continue
             m = exits.mark(pos, book, self.fee_rate(self.market_meta(pos["condition_id"])))

@@ -10,6 +10,10 @@ dependencies = []
 # this extra is installed.
 [project.optional-dependencies]
 live = ["py-clob-client>=0.17"]
+# Streamed order books, so the exit ladder runs on every book update rather than once per poll.
+# Separate from `live` on purpose: streaming reads, it never signs, so paper runs benefit from it
+# and installing it says nothing about whether this program can spend money.
+stream = ["websocket-client>=1.7"]
 
 [project.scripts]
 polywatch = "polywatch.cli:main"

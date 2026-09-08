@@ -149,14 +149,32 @@ whole account with them.
 
 ## 9. Latency budget
 
-Entry latency is bounded by data-api's activity-feed cache and cannot be engineered away — a third
-party's fills can only be polled, never streamed (the market websocket carries no wallet address;
-the user websocket reports only your own account). Exit latency is entirely ours, so book updates
-are streamed and the exit ladder is evaluated continuously rather than once per poll.
+Entry and exit latency are different problems with different answers, and conflating them is how
+a bot ends up polling faster to fix something polling cannot fix.
 
-`signals` records `trader_ts`, `fetch_ts` and `seen_ts` on every row, which makes copy latency a
-**measurement rather than an assumption**, and separates the feed's lag from our own. Tune
+**Entry latency is bounded by the feed.** A third party's fills can only be polled — the CLOB
+market websocket carries no wallet address, and the user websocket reports only your own account.
+So the floor is however stale data-api's `/activity` cache is when it answers, and no poll
+interval gets under it. `signals` records `trader_ts`, `fetch_ts` and `seen_ts` on every row so
+the report can say which half of the delay is the feed's and which is ours. Tune
 `POLL_INTERVAL_S` from that table, never from a comment.
+
+**Exit latency is entirely ours.** The stop-loss, the trailing stop and the time stop are enforced
+by this process and by nothing else, so the interval between checks *is* the resolution of every
+protection a run has. Checked once per poll, a fifteen-second gap in a fast market is a
+fifteen-second option written against us for free.
+
+With the optional `stream` extra the CLOB book channel pushes updates and the exit ladder runs on
+every one of them. Measured against the live feed on 2026-09-09: twenty tokens produced 88 book
+deltas in 35 seconds and 30 distinct top-of-book moves, where a 15-second poll would have looked
+twice. Absent the extra, or when the socket drops, everything falls back to polling — a stale
+price is far more dangerous here than a slow one, so a cached book past `MAX_BOOK_AGE_S` is
+treated as absent rather than trusted.
+
+Books are also fetched together rather than one after another, and the circuit breakers reuse the
+marks the position sweep just computed instead of refetching every book to recompute them. A
+serial sweep made the gap between stop-loss checks grow with the number of positions held, which
+is exactly backwards: the more exposure a run has, the faster it should be looking at it.
 
 ## 10. What would falsify this
 

@@ -181,6 +181,12 @@ def main(argv=None) -> int:
                      help="overrides the task's mode for this run only")
     trn.add_argument("--session-hours", type=float, default=None)
     trn.add_argument("--yes", action="store_true", help="skip the live-mode confirmation")
+    trn.add_argument("--stream", action="store_true",
+                     help="use streamed order books, so the stop-loss and trailing stop are "
+                          "checked on every book update rather than once per poll; needs the "
+                          "optional `stream` extra")
+    trn.add_argument("--no-stream", action="store_true",
+                     help="poll for books even when streaming is available")
 
     trp = tsub.add_parser("report", help="what a run did")
     trp.add_argument("name")
