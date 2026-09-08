@@ -256,9 +256,35 @@ CREATE TABLE IF NOT EXISTS trader_scores (
     top_category     TEXT,
     persona_fit      REAL,
     rank_score       REAL,
+    -- Copyability, from copytrade/replay.py. These are the columns that decide whether a wallet
+    -- is a candidate at all: a superb record with a capture ratio near zero is a wallet whose
+    -- edge does not survive being copied, which is a fact about us, not about them.
+    capture_ratio    REAL,                  -- copier roi at one poll interval / at zero lag
+    edge_half_life_s REAL,                  -- lag at which copier roi reaches zero
+    hold_p50_s       INTEGER,               -- median round-trip holding period
+    fee_adjusted_roi REAL,                  -- their roi with both taker fees charged to it
+    recent_roi       REAL,                  -- exponentially weighted toward recent form
+    luck_p           REAL,                  -- bootstrap p-value that the record is not variance
+    excluded         TEXT,                  -- why this wallet is not a candidate; NULL if it is
     metrics_json     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_trader_scores_rank ON trader_scores(rank_score DESC);
+
+-- The decay curve behind capture_ratio: one row per wallet per copy lag. Kept rather than
+-- collapsed into its summary because the shape matters -- a wallet whose roi falls off a cliff
+-- between 15s and 30s is a different risk from one that decays gently over ten minutes, and the
+-- two can share a capture ratio.
+CREATE TABLE IF NOT EXISTS trader_replay (
+    address        TEXT NOT NULL,
+    lag_s          INTEGER NOT NULL,
+    n              INTEGER NOT NULL,        -- round trips priced at both ends
+    n_missing      INTEGER NOT NULL,        -- round trips with no quote at this lag
+    copier_roi     REAL,                    -- per dollar staked, both taker fees charged
+    copier_pnl     REAL,
+    win_rate       REAL,
+    scanned_at     INTEGER NOT NULL,
+    PRIMARY KEY (address, lag_s)
+);
 
 -- Execution constraints per market. Separate from `markets` because these change on their own
 -- schedule (a market stops accepting orders long before it resolves) and are only ever needed

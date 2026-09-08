@@ -70,6 +70,13 @@ def init_db(con: sqlite3.Connection) -> None:
     for col, decl in (("neg_risk_id", "TEXT"),):
         if col not in have:
             con.execute(f"ALTER TABLE market_meta ADD COLUMN {col} {decl}")
+    # ...and before a score card could say whether the wallet's edge survives being copied.
+    have = {r["name"] for r in con.execute("PRAGMA table_info(trader_scores)")}
+    for col, decl in (("capture_ratio", "REAL"), ("edge_half_life_s", "REAL"),
+                      ("hold_p50_s", "INTEGER"), ("fee_adjusted_roi", "REAL"),
+                      ("recent_roi", "REAL"), ("luck_p", "REAL"), ("excluded", "TEXT")):
+        if col not in have:
+            con.execute(f"ALTER TABLE trader_scores ADD COLUMN {col} {decl}")
     con.commit()
 
 
@@ -679,11 +686,14 @@ def run_summary(con: sqlite3.Connection, run_id: int) -> dict:
 TRADER_SCORE_COLUMNS = ("address", "scanned_at", "n_closed", "win_rate", "roi", "realized_pnl",
                         "brier", "avg_entry_price", "avg_stake_usd", "max_drawdown",
                         "consistency", "est_account_usd", "top_category", "persona_fit",
-                        "rank_score", "metrics_json")
+                        "rank_score", "capture_ratio", "edge_half_life_s", "hold_p50_s",
+                        "fee_adjusted_roi", "recent_roi", "luck_p", "excluded", "metrics_json")
 
 
 def upsert_trader_score(con: sqlite3.Connection, row: dict) -> None:
     row.setdefault("scanned_at", int(time.time()))
+    for c in TRADER_SCORE_COLUMNS:
+        row.setdefault(c, None)
     cols = ",".join(TRADER_SCORE_COLUMNS)
     binds = ",".join(f":{c}" for c in TRADER_SCORE_COLUMNS)
     sets = ",".join(f"{c}=excluded.{c}" for c in TRADER_SCORE_COLUMNS if c != "address")
@@ -697,11 +707,58 @@ def get_trader_score(con: sqlite3.Connection, address: str) -> sqlite3.Row | Non
                        (address.lower(),)).fetchone()
 
 
-def top_trader_scores(con: sqlite3.Connection, limit: int = 30) -> list[sqlite3.Row]:
-    return con.execute(
-        "SELECT * FROM trader_scores WHERE rank_score IS NOT NULL "
-        "ORDER BY rank_score DESC LIMIT ?", (limit,)
-    ).fetchall()
+def top_trader_scores(con: sqlite3.Connection, limit: int = 30,
+                      include_excluded: bool = False) -> list[sqlite3.Row]:
+    """The shortlist, best first. Excluded wallets are held back unless asked for.
+
+    An excluded wallet is not a near-miss to be considered anyway -- it failed a hard gate, such
+    as an edge that does not survive being copied. Seeing them is useful for understanding a
+    sweep; ranking them alongside candidates is not.
+    """
+    sql = "SELECT * FROM trader_scores WHERE rank_score IS NOT NULL"
+    if not include_excluded:
+        sql += " AND excluded IS NULL"
+    return con.execute(sql + " ORDER BY rank_score DESC LIMIT ?", (limit,)).fetchall()
+
+
+def upsert_trader_replay(con: sqlite3.Connection, address: str, rows: list[dict]) -> int:
+    """Replace one wallet's whole decay curve. A rescan overwrites cleanly."""
+    now = int(time.time())
+    con.execute("DELETE FROM trader_replay WHERE address=?", (address.lower(),))
+    con.executemany(
+        """INSERT INTO trader_replay
+               (address, lag_s, n, n_missing, copier_roi, copier_pnl, win_rate, scanned_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        [(address.lower(), r["lag_s"], r["n"], r["n_missing"], r["copier_roi"],
+          r["copier_pnl"], r["win_rate"], now) for r in rows])
+    con.commit()
+    return len(rows)
+
+
+def trader_replay(con: sqlite3.Connection, address: str) -> list[sqlite3.Row]:
+    return con.execute("SELECT * FROM trader_replay WHERE address=? ORDER BY lag_s",
+                       (address.lower(),)).fetchall()
+
+
+def trades_for(con: sqlite3.Connection, address: str, since_ts: int | None = None
+               ) -> list[sqlite3.Row]:
+    """One wallet's fills, oldest first -- the raw material for round-trip matching."""
+    sql = "SELECT * FROM trades WHERE wallet=?"
+    args: tuple = (address.lower(),)
+    if since_ts is not None:
+        sql += " AND ts >= ?"
+        args += (since_ts,)
+    return con.execute(sql + " ORDER BY ts", args).fetchall()
+
+
+def fee_rate_by_condition(con: sqlite3.Connection) -> dict[str, tuple[float | None, str | None]]:
+    """{condition_id: (fee_rate, category)} for every market we have ingested.
+
+    One query rather than one per position: replay charges a fee on both legs of every round
+    trip, and looking each rate up individually turns a scoring pass into a few thousand queries.
+    """
+    return {r[0]: (r[1], r[2]) for r in con.execute(
+        "SELECT condition_id, fee_rate, fee_type FROM markets")}
 
 
 MARKET_META_COLUMNS = ("condition_id", "tick_size", "min_order_size", "accepting_orders",

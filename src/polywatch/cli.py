@@ -82,11 +82,32 @@ def main(argv=None) -> int:
     pa.add_argument("token_id")
     pa.add_argument("ts", type=int)
 
+    dc = sub.add_parser("discover", help="sweep, screen, score and rank wallets worth copying")
+    dc.add_argument("--limit", type=int, default=20, help="shortlist length")
+    dc.add_argument("--pages", type=int, default=1,
+                    help="leaderboard pages per board; 1 board-page is 50 wallets")
+    dc.add_argument("--candidates", type=int, default=60,
+                    help="cap on wallets deep-scored; this stage is where the cost is")
+    dc.add_argument("--category", action="append", default=None,
+                    help="restrict the sweep to these leaderboard categories (repeatable)")
+    dc.add_argument("--no-replay", action="store_true",
+                    help="skip the copy-lag replay. Much faster, and copyability is then "
+                         "inferred from holding period rather than measured")
+    dc.add_argument("--include-excluded", action="store_true",
+                    help="also show wallets that failed a hard gate, and why")
+    dc.add_argument("--rps", type=float, default=MAX_RPS)
+    dc.add_argument("--json", action="store_true")
+    for name, default, helptext in _THRESHOLD_FLAGS:
+        dc.add_argument(f"--{name.replace('_', '-')}", type=type(default), default=default,
+                        help=helptext)
+
     tr = sub.add_parser("trader", help="skill score card for one wallet")
     tr.add_argument("address")
     tr.add_argument("--pages", type=int, default=20,
                     help="settled-position pages to pull; 50 rows each")
     tr.add_argument("--rps", type=float, default=MAX_RPS)
+    tr.add_argument("--no-replay", action="store_true",
+                    help="skip the copy-lag replay and the price backfill it needs")
     tr.add_argument("--json", action="store_true")
 
 
@@ -219,20 +240,49 @@ def main(argv=None) -> int:
         print(store.price_at(con, args.token_id, args.ts))
         return 0
 
-    if args.cmd == "trader":
+    if args.cmd == "discover":
         from .copytrade import discover
         from .fetch.client import Client
         con = store.connect(args.db)
         store.init_db(con)
-        client = Client(con=con, rps=args.rps)
-        sc, est = discover.score_trader(con, client, args.address, max_pages=args.pages)
+        client = Client(con=con, rps=args.rps, dump_raw=False)
+        discover.run(con, client, limit=args.limit, pages=args.pages,
+                     with_replay=not args.no_replay,
+                     categories=[c.upper() for c in args.category] if args.category else None,
+                     thresholds=_thresholds(args), max_candidates=args.candidates)
+        rows = store.top_trader_scores(con, limit=args.limit,
+                                       include_excluded=args.include_excluded)
         if args.json:
-            print(json.dumps({**sc.as_row(), "est_account_usd": est}, indent=2))
+            print(json.dumps([dict(r) for r in rows], indent=2))
+            return 0
+        print()
+        print(discover.format_shortlist(rows))
+        print("\n  Nothing here picks a trader. `polywatch trader <address>` for the full card.")
+        return 0
+
+    if args.cmd == "trader":
+        from .copytrade import discover, replay as replay_mod
+        from .fetch.client import Client
+        con = store.connect(args.db)
+        store.init_db(con)
+        client = Client(con=con, rps=args.rps)
+        sc, est, res = discover.score_trader(con, client, args.address, max_pages=args.pages,
+                                             with_replay=not args.no_replay)
+        if args.json:
+            out = {**sc.as_row(), "est_account_usd": est}
+            if res is not None:
+                out["replay"] = {"lags": [r.as_row() for r in res.lags],
+                                 "capture_ratio": res.capture_ratio,
+                                 "edge_half_life_s": res.edge_half_life_s}
+            print(json.dumps(out, indent=2))
             return 0
         row = con.execute("SELECT username FROM wallets WHERE address=?",
                           (args.address.lower(),)).fetchone()
         print()
         print(discover.format_score(sc, est, row["username"] if row else None))
+        if res is not None:
+            print()
+            print(replay_mod.format_curve(res))
         if sc.n_closed == 0:
             print("\n  no settled positions -- nothing to judge this wallet on")
         return 0

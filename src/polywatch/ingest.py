@@ -147,24 +147,50 @@ def ingest_wallets(con: sqlite3.Connection, client: Client, limit: int, stats: S
     return [r["address"] for r in rows]
 
 
+# How far back a recon read must reach before the behavioural screen can trust its own span.
+# The screen rejects a wallet whose trades cover fewer than `min_active_days` -- and one page is
+# the most recent 1000 fills, which for an active human is three days. Reading one page and then
+# rejecting the wallet for a three-day span measures our page size, not their behaviour, and it
+# rejects hardest exactly where the wallet is most active.
+RECON_SPAN_DAYS = 14
+RECON_MAX_PAGES = 5
+
+
 def recon_trades(con: sqlite3.Connection, client: Client, wallets: list[str], since_ts: int,
-                 stats: Stats, workers: int = 4) -> None:
-    """One page of recent trades per wallet -- enough to fingerprint behaviour before committing
-    to full history. 50 requests here can save tens of thousands downstream."""
+                 stats: Stats, workers: int = 4, span_days: int = RECON_SPAN_DAYS) -> None:
+    """Enough recent trades per wallet to fingerprint behaviour, before committing to full
+    history. A few hundred requests here can save tens of thousands downstream.
+
+    Pages until the read reaches back `span_days`, or the wallet runs out of history, or the page
+    cap. A quiet wallet costs one page; a busy one costs a few, which is the correct way round --
+    the busy wallets are the ones whose span a single page misrepresents.
+    """
     worker = _worker_client(client)
+    floor = max(since_ts, int(time.time()) - span_days * 86400)
 
     def fetch(wallet: str):
+        rows: list[dict] = []
+        pages = 0
         try:
-            return wallet, api.trades(worker, wallet, offset=0, limit=TRADES_PAGE), None
+            for page in range(RECON_MAX_PAGES):
+                payload = api.trades(worker, wallet, offset=page * TRADES_PAGE,
+                                     limit=TRADES_PAGE)
+                parsed = records.parse_trades(payload)
+                pages += 1
+                if not parsed:
+                    break
+                rows.extend(parsed)
+                if len(parsed) < TRADES_PAGE or min(t["ts"] for t in parsed) <= floor:
+                    break
         except FetchError as e:
-            return wallet, None, f"recon {wallet}: {e}"
+            return wallet, rows, pages, f"recon {wallet}: {e}"
+        return wallet, rows, pages, None
 
-    for wallet, payload, err in _parallel(fetch, wallets, workers):
-        stats.trade_pages += 1
+    for wallet, parsed, pages, err in _parallel(fetch, wallets, workers):
+        stats.trade_pages += pages
         if err:
             stats.errors.append(err)
-            continue
-        rows = [t for t in records.parse_trades(payload) if t["ts"] >= since_ts]
+        rows = [t for t in parsed if t["ts"] >= since_ts]
         stats.trades_new += store.insert_trades(con, rows)
     worker.drain_logs(con)
 
