@@ -118,6 +118,11 @@ def main(argv=None) -> int:
                     help="margin demanded on top of the fee floor, e.g. 0.02")
     tc.add_argument("--max-fee-frac", type=float, default=None,
                     help="refuse entries whose round-trip fee exceeds this share of the stake")
+    tc.add_argument("--max-spread-frac", type=float, default=None,
+                    help="refuse entries whose spread exceeds this share of the mid; read it "
+                         "against the fee floor, both are costs paid before being right")
+    tc.add_argument("--min-depth-usd", type=float, default=None,
+                    help="demand this much on the ask side beyond our own stake")
     tc.add_argument("--max-hold-min", type=float, default=None)
     tc.add_argument("--poll", type=float, default=None, help="seconds between polls")
     tc.add_argument("--session-hours", type=float, default=None)

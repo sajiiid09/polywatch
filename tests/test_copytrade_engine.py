@@ -97,7 +97,7 @@ def test_the_stop_is_measured_after_fees_not_on_the_mid():
 
 def test_take_profit_is_not_checked_when_it_is_resting_on_the_book():
     """It is a live GTC order there; checking it here too would sell the position twice."""
-    t = Task(name="a", trader="0x1", tp_value=0.05, resting_tp=True, sl_kind=None)
+    t = Task(tp_kind="pct", name="a", trader="0x1", tp_value=0.05, resting_tp=True, sl_kind=None)
     b = book_of([(0.60, 1000)], [(0.61, 1000)])
     assert exits.check(t, position(), b, fee_rate=0.0, now=1).exit is False
     t.resting_tp = False
@@ -418,7 +418,7 @@ def test_the_round_trip_fee_is_worst_at_even_odds_and_trivial_at_the_extremes():
 
 def test_a_percentage_target_is_widened_to_clear_the_fees():
     """+8% at 0.56 nets +0.9% and risks the full stop. The target moves; the trade stays."""
-    t = Task(name="a", trader="0x1", tp_value=0.08, min_edge=0.02)
+    t = Task(tp_kind="pct", name="a", trader="0x1", tp_value=0.08, min_edge=0.02)
     assert t.target_is_viable(0.56, 0.05) is False
     widened = t.target_price(0.56, 0.05) / 0.56 - 1
     assert widened == pytest.approx(bk.round_trip_fee_frac(0.56, 0.05) + 0.02)
@@ -433,7 +433,7 @@ def test_an_absolute_target_is_never_moved():
 
 
 def test_the_skip_policy_refuses_the_trade_instead_of_moving_the_target():
-    t = Task(name="a", trader="0x1", tp_value=0.08, tp_fee_policy="skip")
+    t = Task(tp_kind="pct", name="a", trader="0x1", tp_value=0.08, tp_fee_policy="skip")
     base = dict(price=0.56, age_s=5, seconds_to_close=99999, usd=100.0, accepting_orders=True)
     assert exits.entry_gates(t, fee_rate=0.05, **base) == "fee_floor"
     assert exits.entry_gates(t, fee_rate=0.005, **base) is None
@@ -442,7 +442,7 @@ def test_the_skip_policy_refuses_the_trade_instead_of_moving_the_target():
 def test_the_off_policy_leaves_a_target_that_cannot_pay_for_itself():
     """Only sane alongside follow_exit, and it stays available because 'the bot silently
     changed my number' is worse than a number the operator chose."""
-    t = Task(name="a", trader="0x1", tp_value=0.08, tp_fee_policy="off")
+    t = Task(tp_kind="pct", name="a", trader="0x1", tp_value=0.08, tp_fee_policy="off")
     assert t.target_price(0.56, 0.05) == pytest.approx(0.56 * 1.08)
 
 
@@ -461,7 +461,7 @@ def test_the_gate_is_unchanged_when_the_fee_rate_is_unknown():
 
 def test_the_ladder_checks_the_same_widened_target_the_order_was_priced_at(con):
     """Otherwise the watched target and the resting target are two different numbers."""
-    t = Task(name="a", trader="0x1", tp_value=0.08, resting_tp=False, sl_kind=None,
+    t = Task(tp_kind="pct", name="a", trader="0x1", tp_value=0.08, resting_tp=False, sl_kind=None,
              trail_pct=0)
     pos = position(avg_price=0.56, cost_usd=56.0)
     b = book_of([(0.605, 1000)], [(0.61, 1000)])        # +8% but under the widened target
@@ -473,7 +473,7 @@ def test_the_ladder_checks_the_same_widened_target_the_order_was_priced_at(con):
 def test_a_target_the_fees_push_out_of_reach_is_not_posted_at_all(con):
     """Posting it would pin the shares behind an order that never fills."""
     books = {"tok": {"bids": [(0.93, 1000)], "asks": [(0.94, 1000)]}}
-    t = Task(name="t", trader="0xtrader", tp_value=0.10, max_price=0.99, max_fee_frac=0.5)
+    t = Task(tp_kind="pct", name="t", trader="0xtrader", tp_value=0.10, max_price=0.99, max_fee_frac=0.5)
     eng, _ = engine_for(con, [activity_event(price=0.94)], books, task=t)
     eng.poll_signals()
     assert store.open_positions(con, eng.state.run_id)      # the position was still taken

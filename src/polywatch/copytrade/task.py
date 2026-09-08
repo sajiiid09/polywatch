@@ -20,9 +20,10 @@ from dataclasses import asdict, dataclass, field, fields
 from . import book as bk
 from ..config import (DEFAULT_BANKROLL_USD, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_DAILY_LOSS_USD,
                       DEFAULT_MAX_DRAWDOWN_PCT, DEFAULT_MAX_FEE_FRAC, DEFAULT_MAX_HOLD_S,
-                      DEFAULT_MAX_MARKET_USD, DEFAULT_MIN_EDGE,
-                      DEFAULT_SLIPPAGE, DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT,
-                      DEFAULT_TRAIL_PCT, MAX_ENTRY_PRICE, MAX_SIGNAL_AGE_S, MIN_ENTRY_PRICE,
+                      DEFAULT_MAX_MARKET_USD, DEFAULT_MAX_SPREAD_FRAC, DEFAULT_MIN_DEPTH_USD,
+                      DEFAULT_MIN_EDGE,
+                      DEFAULT_SLIPPAGE, DEFAULT_STOP_LOSS_PCT, DEFAULT_TRAIL_PCT,
+                      MAX_ENTRY_PRICE, MAX_SIGNAL_AGE_S, MIN_ENTRY_PRICE,
                       MIN_SECONDS_TO_CLOSE, POLL_INTERVAL_S, SESSION_MAX_HOURS)
 
 
@@ -48,8 +49,11 @@ class Task:
     # 0..1 level, None disables the rung.
     sl_kind: str | None = "pct"
     sl_value: float | None = DEFAULT_STOP_LOSS_PCT
-    tp_kind: str | None = "pct"
-    tp_value: float | None = DEFAULT_TAKE_PROFIT_PCT
+    # No take-profit by default. The note at the bottom of this file measures what one costs:
+    # a fixed target truncates exactly the tail that pays for the losers. Leaving the dataclass
+    # default at 'pct' contradicted that finding for anyone constructing a Task without a preset.
+    tp_kind: str | None = None
+    tp_value: float | None = None
     # A percentage take-profit is meaningless until it clears both taker fees, and what it has
     # to clear depends on the entry price: a round trip costs 10% of stake at 0.50 and 1% at
     # 0.90. `tp_fee_policy` says what to do when the configured target is under that floor.
@@ -79,6 +83,11 @@ class Task:
     max_price: float = MAX_ENTRY_PRICE
     min_seconds_to_close: int = MIN_SECONDS_TO_CLOSE
     min_trade_usd: float = 0.0              # ignore the trader's own dust
+    # Liquidity. Checked against the real book before a copy is recorded as copied, so that a
+    # market too thin to trade shows up in the skip histogram as illiquidity rather than as a
+    # rejected order nobody reads.
+    max_spread_frac: float = DEFAULT_MAX_SPREAD_FRAC
+    min_depth_usd: float = DEFAULT_MIN_DEPTH_USD
 
     # --- run bounds ---------------------------------------------------------------------
     poll_interval_s: float = POLL_INTERVAL_S

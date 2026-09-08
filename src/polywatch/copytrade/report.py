@@ -18,21 +18,27 @@ def _dt(ts: int | None) -> str:
     return "-" if not ts else datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
-def latency_block(stats: dict, poll_interval_s: float) -> list[str]:
+def latency_block(stats: dict, poll_interval_s: float, split: dict | None = None) -> list[str]:
     """Measured copy latency: seen_ts - trader_ts, per signal.
 
-    Read against the poll interval. If p50 is roughly half the interval the poller is keeping
-    up and the residual is the feed's own lag; if p50 approaches the interval, polls are
-    overrunning. If p90 exceeds the staleness gate, most of what this trader does is
-    uncopyable at this cadence whatever the median says.
+    Read against the poll interval. If p90 exceeds the staleness gate, most of what this trader
+    does is uncopyable at this cadence whatever the median says.
+
+    The split is the actionable half. `feed` is how stale data-api's answer already was when it
+    reached us, which polling faster cannot fix and which is a fact about the trader's
+    copyability rather than about this program. `loop` is ours, and is the only part worth
+    tuning `POLL_INTERVAL_S` against.
     """
     if not stats.get("n"):
         return ["  latency        no signals observed"]
     out = [f"  latency        n={stats['n']}  p50 {stats['p50']}s  p90 {stats['p90']}s  "
            f"p99 {stats['p99']}s  max {stats['max']}s  (poll {poll_interval_s:.0f}s)"]
-    if stats["p50"] > poll_interval_s * 1.5:
-        out.append(f"                 p50 exceeds the poll interval -- the feed is lagging, "
-                   f"not the loop")
+    if split and split.get("n"):
+        out.append(f"                 of which  feed {split['feed']:.1f}s  "
+                   f"loop {split['loop']:.1f}s  on average")
+        if split["feed"] > split["loop"] * 2 and split["feed"] > 2:
+            out.append("                 the feed is the bottleneck, not the loop -- a shorter "
+                       "poll interval will not help")
     return out
 
 
@@ -58,7 +64,8 @@ def run_report(con, run_id: int, task=None) -> str:
         f"{s['skipped']} skipped",
         f"  positions      {s['positions_closed']} closed, {s['positions_open']} still open",
     ]
-    lines += latency_block(store.latency_stats(con, run_id), poll)
+    lines += latency_block(store.latency_stats(con, run_id), poll,
+                           store.latency_split(con, run_id))
 
     if s["realized_pnl"] and s["fees_paid"]:
         gross = s["realized_pnl"] + s["fees_paid"]

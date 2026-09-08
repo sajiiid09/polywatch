@@ -38,7 +38,9 @@ def _build(args) -> Task:
                          ("poll", "poll_interval_s"), ("session_hours", "session_hours"),
                          ("max_loss", "max_daily_loss_usd"),
                          ("max_drawdown", "max_drawdown_pct"), ("tp_policy", "tp_fee_policy"),
-                         ("min_edge", "min_edge"), ("max_fee_frac", "max_fee_frac")):
+                         ("min_edge", "min_edge"), ("max_fee_frac", "max_fee_frac"),
+                         ("max_spread_frac", "max_spread_frac"),
+                         ("min_depth_usd", "min_depth_usd")):
         v = getattr(args, flag, None)
         if v is not None:
             over[field_] = v
@@ -95,6 +97,9 @@ def _describe(t: Task) -> str:
          ) if t.tp_kind == "pct" else "",
         f"                entries refused above {t.max_fee_frac:.0%} fee"
         if t.max_fee_frac else "",
+        f"  liquidity     spread over {t.max_spread_frac:.0%} of mid is refused"
+        + (f"; ask side must hold ${t.min_depth_usd:,.2f}" if t.min_depth_usd else "")
+        if t.max_spread_frac else "",
         f"  time stop     {t.max_hold_s / 60:.0f} min",
         f"  follow exits  {'yes' if t.follow_exit else 'no'}",
         f"  poll          {t.poll_interval_s:.0f}s, skip signals older than "

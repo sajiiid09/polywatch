@@ -130,6 +130,9 @@ def parse_market(rec: dict) -> tuple[dict, list[dict]]:
         "resolved": resolved,
         "winning_index": winner,
         "neg_risk": 1 if rec.get("negRisk") else 0,
+        # The id shared by every outcome of one neg-risk event. Without it a per-market exposure
+        # cap caps nothing there: three condition ids can be three ways of holding one view.
+        "neg_risk_id": opt(rec, "negRiskMarketID", str, ctx),
         "fees_enabled": 1 if rec.get("feesEnabled") else 0,
         "fee_type": opt(rec, "feeType", str, ctx),
         # Execution constraints. Read here rather than from the CLOB /tick-size endpoint

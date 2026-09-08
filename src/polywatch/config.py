@@ -150,3 +150,18 @@ CLOB_CHAIN_ID = 137                      # Polygon mainnet
 # of the stake, which no exit rule can undo.
 DEFAULT_MIN_EDGE = 0.02
 DEFAULT_MAX_FEE_FRAC = 0.12
+
+# Liquidity floor. The spread is the other cost a round trip pays before the trade is right about
+# anything, and it is expressed as a fraction of the mid so it reads in the same unit as the fee
+# floor above: 10% here is the same size of problem as a 10% round-trip fee. A book this wide is
+# not a market a copier can flip in, whatever the trader saw in it.
+DEFAULT_MAX_SPREAD_FRAC = 0.10
+# Absolute depth demanded on the side we are about to take, over and above being able to fill our
+# own stake. 0 means "just enough for us", which is the honest default at a $10 stake -- there is
+# no point demanding a deep book to spend ten dollars.
+DEFAULT_MIN_DEPTH_USD = 0.0
+
+# How many pages of /activity one poll will read before giving up and calling the read truncated.
+# Each page is ACTIVITY_PAGE events; five of them is 500 events in one poll interval, which is far
+# past any human and well past the point where copying is the right response.
+MAX_ACTIVITY_PAGES = 5

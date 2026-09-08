@@ -43,7 +43,8 @@ def init_db(con: sqlite3.Connection) -> None:
     # table that already exists, so these have to be spelled out.
     have = {r["name"] for r in con.execute("PRAGMA table_info(markets)")}
     for col, decl in (("gamma_id", "TEXT"), ("tick_size", "REAL"), ("order_min_size", "REAL"),
-                      ("accepting_orders", "INTEGER"), ("enable_order_book", "INTEGER")):
+                      ("accepting_orders", "INTEGER"), ("enable_order_book", "INTEGER"),
+                      ("neg_risk_id", "TEXT")):
         if col not in have:
             con.execute(f"ALTER TABLE markets ADD COLUMN {col} {decl}")
     # ...and for databases written before a partially-sold position had anywhere to put the fees
@@ -59,6 +60,16 @@ def init_db(con: sqlite3.Connection) -> None:
     for col, decl in (("exchange_id", "TEXT"),):
         if col not in have:
             con.execute(f"ALTER TABLE orders ADD COLUMN {col} {decl}")
+    # ...and before a signal recorded when its page arrived, which is what separates the feed's
+    # lag from the loop's. Old rows keep NULL and the report falls back to the combined figure.
+    have = {r["name"] for r in con.execute("PRAGMA table_info(signals)")}
+    for col, decl in (("fetch_ts", "INTEGER"),):
+        if col not in have:
+            con.execute(f"ALTER TABLE signals ADD COLUMN {col} {decl}")
+    have = {r["name"] for r in con.execute("PRAGMA table_info(market_meta)")}
+    for col, decl in (("neg_risk_id", "TEXT"),):
+        if col not in have:
+            con.execute(f"ALTER TABLE market_meta ADD COLUMN {col} {decl}")
     con.commit()
 
 
@@ -361,12 +372,13 @@ def insert_signal(con: sqlite3.Connection, row: dict) -> int | None:
     stale trade would be most expensive.
     """
     row.setdefault("seen_ts", int(time.time()))
+    row.setdefault("fetch_ts", row["seen_ts"])
     cur = con.execute(
         """INSERT OR IGNORE INTO signals
                (run_id, trader, kind, tx_hash, token_id, condition_id, side, size, price,
-                usdc_size, trader_ts, seen_ts, action, reason)
+                usdc_size, trader_ts, fetch_ts, seen_ts, action, reason)
            VALUES (:run_id,:trader,:kind,:tx_hash,:token_id,:condition_id,:side,:size,:price,
-                :usdc_size,:trader_ts,:seen_ts,:action,:reason)""",
+                :usdc_size,:trader_ts,:fetch_ts,:seen_ts,:action,:reason)""",
         row,
     )
     con.commit()
@@ -390,6 +402,28 @@ def signals(con: sqlite3.Connection, run_id: int, action: str | None = None
         sql += " AND action=?"
         args += (action,)
     return con.execute(sql + " ORDER BY seen_ts, id", args).fetchall()
+
+
+def trader_observed_shares(con: sqlite3.Connection, run_id: int, trader: str, token_id: str,
+                           before_ts: int | None = None) -> float:
+    """Shares of one token the target has accumulated *as far as this run has watched them*.
+
+    Buys minus sells across every signal recorded for them, copied or skipped -- which is why
+    skipped signals are recorded at all. It is a floor, not their position: anything they were
+    holding before the run started is invisible to it.
+
+    That floor is the safe direction. Used to size a proportional follow-exit, underestimating
+    what they hold overestimates the fraction they just sold, so we exit at least as much as they
+    did. The failure mode is the old behaviour -- selling everything -- not selling too little.
+    """
+    sql = """SELECT COALESCE(SUM(CASE WHEN side='BUY' THEN size ELSE -size END), 0)
+             FROM signals WHERE run_id=? AND trader=? AND token_id=? AND kind='TRADE'
+                          AND side IS NOT NULL"""
+    args: tuple = (run_id, trader, token_id)
+    if before_ts is not None:
+        sql += " AND trader_ts < ?"
+        args += (before_ts,)
+    return float(con.execute(sql, args).fetchone()[0])
 
 
 def skip_reasons(con: sqlite3.Connection, run_id: int) -> list[tuple[str, int]]:
@@ -586,6 +620,21 @@ def market_exposure(con: sqlite3.Connection, run_id: int, condition_id: str) -> 
     return float(row[0])
 
 
+def event_exposure(con: sqlite3.Connection, run_id: int, neg_risk_id: str) -> float:
+    """Open cost across every market belonging to one neg-risk event.
+
+    The outcomes of a neg-risk event are mutually exclusive slices of a single question. Holding
+    three of them is one view expressed three times, and a cap applied per market would let it
+    through three times over.
+    """
+    row = con.execute(
+        """SELECT COALESCE(SUM(p.cost_usd + p.fees_paid), 0) FROM positions p
+           JOIN market_meta m ON m.condition_id = p.condition_id
+           WHERE p.run_id=? AND p.open=1 AND m.neg_risk_id=?""",
+        (run_id, neg_risk_id)).fetchone()
+    return float(row[0])
+
+
 def run_cash(con: sqlite3.Connection, run_id: int) -> float:
     """Uninvested cash: the starting bankroll, minus what open positions tie up, plus what
     closed ones returned."""
@@ -656,12 +705,14 @@ def top_trader_scores(con: sqlite3.Connection, limit: int = 30) -> list[sqlite3.
 
 
 MARKET_META_COLUMNS = ("condition_id", "tick_size", "min_order_size", "accepting_orders",
-                       "enable_order_book", "neg_risk", "category_derived", "fee_rate",
-                       "end_ts", "fetched_at")
+                       "enable_order_book", "neg_risk", "neg_risk_id", "category_derived",
+                       "fee_rate", "end_ts", "fetched_at")
 
 
 def upsert_market_meta(con: sqlite3.Connection, row: dict) -> None:
     row.setdefault("fetched_at", int(time.time()))
+    for c in MARKET_META_COLUMNS:
+        row.setdefault(c, None)
     cols = ",".join(MARKET_META_COLUMNS)
     binds = ",".join(f":{c}" for c in MARKET_META_COLUMNS)
     sets = ",".join(f"{c}=excluded.{c}" for c in MARKET_META_COLUMNS if c != "condition_id")
@@ -733,6 +784,24 @@ def orphan_resting(con: sqlite3.Connection, mode: str = "live") -> list[sqlite3.
         """SELECT r.* FROM resting_orders r JOIN task_runs t ON t.id = r.run_id
            WHERE r.status='open' AND r.mode=? AND t.stopped_at IS NOT NULL
            ORDER BY r.placed_ts""", (mode,)).fetchall()
+
+
+def latency_split(con: sqlite3.Connection, run_id: int) -> dict:
+    """Where copy latency actually comes from, averaged over a run.
+
+    `feed` is fetch_ts - trader_ts: how stale the activity endpoint's answer was before we ever
+    saw it, which no amount of polling faster can fix. `loop` is seen_ts - fetch_ts: our own
+    processing, which is the only half worth optimising. Rows written before fetch_ts existed
+    report loop=0 and are honest about it by carrying the whole gap in `feed`.
+    """
+    row = con.execute(
+        """SELECT COUNT(*),
+                  AVG(COALESCE(fetch_ts, seen_ts) - trader_ts),
+                  AVG(seen_ts - COALESCE(fetch_ts, seen_ts))
+           FROM signals WHERE run_id=?""", (run_id,)).fetchone()
+    if not row or not row[0]:
+        return {"n": 0}
+    return {"n": int(row[0]), "feed": float(row[1] or 0.0), "loop": float(row[2] or 0.0)}
 
 
 def latency_samples(con: sqlite3.Connection, run_id: int | None = None) -> list[int]:

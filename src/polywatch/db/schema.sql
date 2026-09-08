@@ -36,6 +36,7 @@ CREATE TABLE IF NOT EXISTS markets (
     resolved         INTEGER NOT NULL DEFAULT 0,
     winning_index    INTEGER,              -- index into outcomes_json, NULL unless resolved
     neg_risk         INTEGER,
+    neg_risk_id      TEXT,                 -- shared by every outcome of one neg-risk event
     fees_enabled     INTEGER,
     fee_type         TEXT,                 -- e.g. 'sports_fees_v3', 'politics_fees'
     fee_rate         REAL,                 -- from the market's own feeSchedule when present
@@ -174,7 +175,11 @@ CREATE TABLE IF NOT EXISTS signals (
     price        REAL,
     usdc_size    REAL,
     trader_ts    INTEGER NOT NULL,          -- when they traded
-    seen_ts      INTEGER NOT NULL,          -- when we noticed; the difference is copy latency
+    -- Three timestamps, because "we were late" has two causes and only one of them is ours.
+    -- fetch_ts - trader_ts is the feed's own lag (data-api caches /activity); seen_ts - fetch_ts
+    -- is this loop's. Tuning the poll interval from their sum cannot tell which one moved.
+    fetch_ts     INTEGER,                   -- when the response carrying this event landed
+    seen_ts      INTEGER NOT NULL,          -- when we acted on it; the difference is copy latency
     action       TEXT NOT NULL,             -- 'copied' | 'skipped'
     reason       TEXT,
     -- One transaction can carry several fills, same as `trades`. This tuple is what makes the
@@ -265,6 +270,7 @@ CREATE TABLE IF NOT EXISTS market_meta (
     accepting_orders  INTEGER,
     enable_order_book INTEGER,
     neg_risk          INTEGER,
+    neg_risk_id       TEXT,                 -- what the per-event exposure cap is grouped on
     category_derived  TEXT,                 -- from feeType, since markets.category is always NULL
     fee_rate          REAL,
     end_ts            INTEGER,

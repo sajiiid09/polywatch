@@ -27,7 +27,8 @@ import signal as _signal
 import time
 from dataclasses import dataclass, field
 
-from ..config import (MIN_ORDER_SHARES_FALLBACK, POLL_OVERLAP_S, TICK_SIZE_FALLBACK)
+from ..config import (ACTIVITY_PAGE, MAX_ACTIVITY_PAGES, MIN_ORDER_SHARES_FALLBACK,
+                      POLL_OVERLAP_S, TICK_SIZE_FALLBACK)
 from ..db import store
 from ..fetch import polymarket as api
 from ..fetch.client import Client, FetchError
@@ -72,6 +73,7 @@ class RunState:
     polls: int = 0
     errors: int = 0
     adopted: int = 0
+    truncated_polls: int = 0
     stop_reason: str | None = None
 
 
@@ -118,6 +120,7 @@ class Engine:
             "accepting_orders": m["accepting_orders"],
             "enable_order_book": m["enable_order_book"],
             "neg_risk": m["neg_risk"],
+            "neg_risk_id": m.get("neg_risk_id"),
             "category_derived": records.derive_category(m["fee_type"], m["category"]),
             "fee_rate": m.get("fee_rate"),
             "end_ts": m["end_ts"],
@@ -301,6 +304,30 @@ class Engine:
 
     # --- signals ------------------------------------------------------------------------
 
+    def read_activity(self, start: int | None) -> tuple[list[dict], int, bool]:
+        """Every event since `start`, paged out. Returns (events, fetch_ts, truncated).
+
+        The feed is newest-first and one page is 100 events, so a single page is not a read of
+        "everything since the watermark" -- it is a read of the most recent hundred things. A
+        trader who did more than that between polls, or a poll after any stall, silently lost the
+        remainder while the watermark advanced past it. Nothing recorded that it had happened.
+
+        So: page until a page comes back short, or until it reaches back past the watermark, or
+        until the page cap. Hitting the cap is `truncated`, which the caller counts as a run
+        error rather than swallowing.
+        """
+        out: list[dict] = []
+        for page in range(MAX_ACTIVITY_PAGES):
+            payload = api.activity(self.client, self.task.trader, offset=page * ACTIVITY_PAGE,
+                                   start_ts=start, dump_raw=False)
+            rows = records.parse_activity(payload)
+            out.extend(rows)
+            if len(rows) < ACTIVITY_PAGE:
+                return out, self.now(), False
+            if start is not None and min(r["ts"] for r in rows) <= start:
+                return out, self.now(), False
+        return out, self.now(), True
+
     def poll_signals(self) -> int:
         """Read the trader's recent activity and act on anything new.
 
@@ -308,20 +335,40 @@ class Engine:
         redundancy for its own sake: the activity feed is served from a cache, and a fill can
         appear in it slightly after a later one. The UNIQUE constraint on `signals` makes
         re-reading free.
+
+        The watermark moves behind the loop, not ahead of it. Advancing it before handling an
+        event meant that a failure partway through a page left the watermark past events that
+        were never processed, and the next poll would never look at them again. Events are
+        handled oldest-first and the watermark follows the last one that actually succeeded, so
+        a failure costs a re-read rather than a fill.
         """
         s = self.state
         start = max(0, s.last_seen_ts - POLL_OVERLAP_S) if s.last_seen_ts else None
-        payload = api.activity(self.client, self.task.trader, start_ts=start, dump_raw=False)
-        events = records.parse_activity(payload)
-        seen_ts = self.now()
+        events, fetch_ts, truncated = self.read_activity(start)
+        if truncated:
+            s.errors += 1
+            s.truncated_polls += 1
+            self.log(f"  ! activity read hit the {MAX_ACTIVITY_PAGES}-page cap; some events "
+                     f"were not read this poll")
+
         acted = 0
+        watermark = s.last_seen_ts
         for ev in sorted(events, key=lambda e: e["ts"]):
-            s.last_seen_ts = max(s.last_seen_ts, ev["ts"])
-            if self.handle_event(ev, seen_ts):
-                acted += 1
+            try:
+                if self.handle_event(ev, self.now(), fetch_ts):
+                    acted += 1
+            except FetchError:
+                raise
+            except Exception as e:  # noqa: BLE001 - one bad event must not skip the rest forever
+                s.errors += 1
+                self.log(f"  ! event {ev.get('tx_hash', '')[:12]} failed: "
+                         f"{type(e).__name__}: {e}")
+                break
+            watermark = max(watermark, ev["ts"])
+        s.last_seen_ts = watermark
         return acted
 
-    def handle_event(self, ev: dict, seen_ts: int) -> bool:
+    def handle_event(self, ev: dict, seen_ts: int, fetch_ts: int | None = None) -> bool:
         """Record one observed action of the trader, and copy it if every gate passes.
 
         Returns True if this was the first time we saw it. The dedupe is the database's, not a
@@ -333,10 +380,11 @@ class Engine:
             # SPLIT / MERGE / REDEEM still get recorded: they are how a position can leave the
             # trader's book without a sell, and a report that omits them looks like the trader
             # simply stopped trading.
-            return self._record(ev, seen_ts, "skipped", f"kind_{ev['kind'].lower()}") is not None
+            return self._record(ev, seen_ts, "skipped", f"kind_{ev['kind'].lower()}",
+                                fetch_ts) is not None
 
         if ev["side"] == "SELL":
-            return self._handle_trader_sell(ev, seen_ts)
+            return self._handle_trader_sell(ev, seen_ts, fetch_ts)
 
         held = store.open_position_for(self.con, s.run_id, ev["token_id"])
         meta = self.market_meta(ev["condition_id"])
@@ -347,17 +395,50 @@ class Engine:
             usd=ev["usdc_size"], fee_rate=self.fee_rate(meta), accepting_orders=(
                 None if meta.get("accepting_orders") is None else bool(meta["accepting_orders"])))
         if reason is None:
-            reason = self._portfolio_gates(ev, held)
-        if reason is not None:
-            return self._record(ev, seen_ts, "skipped", reason) is not None
+            reason = self._portfolio_gates(ev, held, meta)
 
-        sig_id = self._record(ev, seen_ts, "copied", None)
+        # The book is the last gate and the only one that costs a request, so it runs last --
+        # but it runs before the signal is recorded, so illiquidity appears in the skip histogram
+        # instead of as a rejected order that nothing reports on.
+        book = None
+        if reason is None:
+            book = self.book(ev["token_id"])
+            reason = exits.book_gates(t, book, usd=self._stake_for(ev, meta))
+
+        if reason is not None:
+            return self._record(ev, seen_ts, "skipped", reason, fetch_ts) is not None
+
+        sig_id = self._record(ev, seen_ts, "copied", None, fetch_ts)
         if sig_id is None:
             return False  # already handled on an earlier poll
-        self.copy_buy(ev, sig_id, meta, held)
+        self.copy_buy(ev, sig_id, meta, held, book)
         return True
 
-    def _portfolio_gates(self, ev: dict, held) -> str | None:
+    def _stake_for(self, ev: dict, meta: dict) -> float:
+        """What we would actually spend on this trade, after every cap that applies.
+
+        One expression, called from the gate and from the order, because the two disagreeing is
+        how a trade passes a check on a number it is not going to use.
+        """
+        s, t = self.state, self.task
+        return min(t.stake_usd(ev["usdc_size"], s.trader_account_usd),
+                   t.max_market_usd - self.exposure(ev["condition_id"], meta),
+                   store.run_cash(self.con, s.run_id))
+
+    def exposure(self, condition_id: str, meta: dict) -> float:
+        """Open cost across one market -- or across a whole neg-risk event, when it is one.
+
+        In a neg-risk market the outcomes are mutually exclusive slices of one question, so three
+        `condition_id`s can be three ways of holding the same view. Capping each separately caps
+        nothing.
+        """
+        s = self.state
+        group = meta.get("neg_risk_id")
+        if group:
+            return store.event_exposure(self.con, s.run_id, group)
+        return store.market_exposure(self.con, s.run_id, condition_id)
+
+    def _portfolio_gates(self, ev: dict, held, meta: dict) -> str | None:
         """Gates that depend on our book rather than on the trade."""
         s, t = self.state, self.task
         # Buying the other outcome of a market we are already in pays two entry fees and two
@@ -368,62 +449,89 @@ class Engine:
             return "holds_other_outcome"
         if held is None and len(store.open_positions(self.con, s.run_id)) >= t.max_concurrent:
             return "max_concurrent"
-        exposure = store.market_exposure(self.con, s.run_id, ev["condition_id"])
-        if exposure >= t.max_market_usd:
+        if self.exposure(ev["condition_id"], meta) >= t.max_market_usd:
             return "max_market_usd"
-        stake = t.stake_usd(ev["usdc_size"], s.trader_account_usd)
-        if stake <= 0:
+        if t.stake_usd(ev["usdc_size"], s.trader_account_usd) <= 0:
             return "stake_zero"
-        if stake > store.run_cash(self.con, s.run_id):
+        if store.run_cash(self.con, s.run_id) <= 0:
             return "insufficient_cash"
+        # The stake after every cap, not before: a trade can clear the cash and exposure checks
+        # and still be squeezed under the market's minimum order size by them. That used to
+        # produce a rejected order and no skip reason, so the histogram never saw it.
+        stake = self._stake_for(ev, meta)
+        if stake <= 0:
+            return "insufficient_cash"
+        min_shares = meta.get("min_order_size") or MIN_ORDER_SHARES_FALLBACK
+        if ev["price"] > 0 and stake / ev["price"] < min_shares:
+            return "below_min_size"
         return None
 
-    def _handle_trader_sell(self, ev: dict, seen_ts: int) -> bool:
+    def _handle_trader_sell(self, ev: dict, seen_ts: int, fetch_ts: int | None = None) -> bool:
         """The trader sold. If we are in that token and following their exits, so do we.
 
         Copying the exit matters more than copying the entry. The reason to copy a quick-flip
         trader is that they know when the move is over; our own ladder is a floor under that
         judgement, not a substitute for it.
+
+        We sell the *fraction* of our position that they sold of theirs, not all of it. Scaling
+        out of a winner in thirds is an ordinary thing to do, and answering it by dumping the
+        whole position copies neither their entry nor their exit -- it just leaves the trade
+        early and pays a full exit fee for the privilege.
+
+        Their position size is only known as far as this run has watched them, which is a floor
+        (see `store.trader_observed_shares`). When that floor says they held no more than they
+        just sold, the fraction is 1 and we close outright -- the same behaviour as before, now
+        reached because it is right rather than by default.
         """
         s, t = self.state, self.task
         held = store.open_position_for(self.con, s.run_id, ev["token_id"])
         if held is None:
-            return self._record(ev, seen_ts, "skipped", "not_held") is not None
+            return self._record(ev, seen_ts, "skipped", "not_held", fetch_ts) is not None
         if not t.follow_exit:
-            return self._record(ev, seen_ts, "skipped", "follow_exit_off") is not None
-        sig_id = self._record(ev, seen_ts, "copied", None)
+            return self._record(ev, seen_ts, "skipped", "follow_exit_off", fetch_ts) is not None
+
+        # Computed before the sell is recorded, so their own sale is not counted against them.
+        theirs = store.trader_observed_shares(self.con, s.run_id, t.trader, ev["token_id"],
+                                              before_ts=ev["ts"])
+        sig_id = self._record(ev, seen_ts, "copied", None, fetch_ts)
         if sig_id is None:
             return False
-        self.close(held, exits.FOLLOW_EXIT, signal_id=sig_id)
+        frac = 1.0 if theirs <= 0 else min(1.0, (ev["size"] or 0.0) / theirs)
+        shares = held["shares"] if frac >= 1.0 else held["shares"] * frac
+        if frac < 1.0:
+            self.log(f"  trader sold {frac:.0%} of their position; matching it")
+        self.close(held, exits.FOLLOW_EXIT, signal_id=sig_id, shares=shares)
         return True
 
-    def _record(self, ev: dict, seen_ts: int, action: str, reason: str | None) -> int | None:
+    def _record(self, ev: dict, seen_ts: int, action: str, reason: str | None,
+                fetch_ts: int | None = None) -> int | None:
         return store.insert_signal(self.con, {
             "run_id": self.state.run_id, "trader": self.task.trader, "kind": ev["kind"],
             "tx_hash": ev["tx_hash"], "token_id": ev["token_id"],
             "condition_id": ev["condition_id"], "side": ev["side"] or None,
             "size": ev["size"], "price": ev["price"], "usdc_size": ev["usdc_size"],
-            "trader_ts": ev["ts"], "seen_ts": seen_ts, "action": action, "reason": reason,
+            "trader_ts": ev["ts"], "fetch_ts": fetch_ts or seen_ts, "seen_ts": seen_ts,
+            "action": action, "reason": reason,
         })
 
     # --- execution ----------------------------------------------------------------------
 
-    def copy_buy(self, ev: dict, signal_id: int, meta: dict, held) -> Fill | None:
+    def copy_buy(self, ev: dict, signal_id: int, meta: dict, held,
+                 book: dict | None = None) -> Fill | None:
         s, t = self.state, self.task
-        book = self.book(ev["token_id"])
+        # The gate already paid for this book. Re-fetching it would cost a request and, worse,
+        # would decide on a book different from the one the trade was approved against.
+        book = book if book is not None else self.book(ev["token_id"])
         if book is None:
             return None
-        stake = min(t.stake_usd(ev["usdc_size"], s.trader_account_usd),
-                    t.max_market_usd - store.market_exposure(self.con, s.run_id,
-                                                             ev["condition_id"]),
-                    store.run_cash(self.con, s.run_id))
+        stake = self._stake_for(ev, meta)
         w = bk.buy_for_usd(book, stake)
         if not w.filled:
             self._log_order(signal_id, ev, "BUY", stake, 0.0,
                             Fill("rejected", reason="empty book"))
             return None
         tick = meta.get("tick_size") or TICK_SIZE_FALLBACK
-        limit = bk.limit_price(w.vwap, t.slippage, tick, "BUY")
+        limit = bk.limit_price(bk.best_ask(book) or w.vwap, t.slippage, tick, "BUY")
         rate = self.fee_rate(meta)
         fill = self.ex.buy(ev["token_id"], stake, book, limit=limit, tick=tick,
                            fee_rate=rate, min_shares=meta.get("min_order_size")
@@ -491,22 +599,32 @@ class Engine:
             store.settle_resting(self.con, row["id"], "cancelled" if ok else "open",
                                  reason=why if ok else "cancel failed")
 
-    def close(self, pos, reason: str, signal_id: int | None = None) -> Fill | None:
-        """Sell out of a position at market, within the slippage bound."""
+    def close(self, pos, reason: str, signal_id: int | None = None,
+              shares: float | None = None) -> Fill | None:
+        """Sell out of a position at market, within the slippage bound.
+
+        `shares` sells only part of it, which is what following a trader who scales out looks
+        like. The resting take-profit is cancelled either way: it was priced against a position
+        of a different size, and leaving it would sell shares the exit ladder no longer knows
+        about.
+        """
         meta = self.market_meta(pos["condition_id"])
         book = self.book(pos["token_id"])
         if book is None:
             return None
         self.cancel_resting(pos["id"], reason)
         pos = self.con.execute("SELECT * FROM positions WHERE id=?", (pos["id"],)).fetchone()
-        w = bk.sell_shares(book, pos["shares"])
+        want = pos["shares"] if shares is None else min(shares, pos["shares"])
+        if want <= 0:
+            return None
+        w = bk.sell_shares(book, want)
         if not w.filled:
             self.log(f"  ! cannot exit {pos['token_id'][:10]}: no bids ({reason})")
             return None
         tick = meta.get("tick_size") or TICK_SIZE_FALLBACK
-        limit = bk.limit_price(w.vwap, self.task.slippage, tick, "SELL")
+        limit = bk.limit_price(bk.best_bid(book) or w.vwap, self.task.slippage, tick, "SELL")
         rate = self.fee_rate(meta)
-        fill = self.ex.sell(pos["token_id"], pos["shares"], book, limit=limit, tick=tick,
+        fill = self.ex.sell(pos["token_id"], want, book, limit=limit, tick=tick,
                             fee_rate=rate)
         self._log_order(signal_id, {"token_id": pos["token_id"],
                                     "condition_id": pos["condition_id"]},

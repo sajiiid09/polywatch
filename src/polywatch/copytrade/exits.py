@@ -14,6 +14,10 @@ The rungs, in the order they are checked:
   4. max_hold     -- a quick flip that has not worked in 45 minutes is not going to.
   5. no_bid       -- nothing to sell into. Not an exit; a warning that the exits are notional.
 
+Entry is gated in two passes, `entry_gates` then `book_gates`, split by what they cost: the first
+reads numbers we already have, the second needs the order book. Both run before a signal is
+recorded as copied, so every refusal lands in the skip histogram.
+
 Every threshold is measured against the *net* exit price -- what the bid side would actually
 pay after the taker fee -- not the mid, and not the last trade. A stop measured on the mid is a
 stop that does not fire until the loss is already worse than it says.
@@ -115,6 +119,37 @@ def breaker(task, start_bankroll: float, realized_pnl: float, unrealized_pnl: fl
             return Decision(True, CIRCUIT_BREAKER,
                             f"drawdown {dd:.1%}, limit {task.max_drawdown_pct:.0%}")
     return Decision(False)
+
+
+def book_gates(task, book: dict | None, *, usd: float) -> str | None:
+    """Why not to copy this trade, given the book we would actually have to buy from.
+
+    Separate from `entry_gates` because it costs a request, so it runs last -- but it runs
+    *before* the signal is recorded as copied, which is the point. Discovering illiquidity inside
+    the executor produced a rejected order and no skip reason, so the histogram that a paper run
+    exists to produce could not see the most common reason a copy is not worth making.
+
+    Three refusals, in the order a trade dies of them:
+
+      no_book     -- nothing quoted, or one side missing entirely.
+      wide_spread -- crossing costs more than `max_spread_frac` of the mid. This is the same kind
+                     of cost as the fee floor and is measured in the same unit, so the two can be
+                     read against each other.
+      thin_book   -- the ask side cannot supply our stake, or cannot meet `min_depth_usd`. Buying
+                     what a book cannot sell means paying through it on the way in and finding
+                     nobody there on the way out.
+    """
+    if not book or not book.get("asks") or not book.get("bids"):
+        return "no_book"
+    sf = bk.spread_frac(book)
+    if sf is None:
+        return "no_book"
+    if task.max_spread_frac > 0 and sf > task.max_spread_frac:
+        return "wide_spread"
+    depth = bk.buy_for_usd(book, max(usd, task.min_depth_usd))
+    if depth.exhausted or depth.cost < max(usd, task.min_depth_usd) - 1e-6:
+        return "thin_book"
+    return None
 
 
 def entry_gates(task, *, price: float, age_s: int, seconds_to_close: int | None,
