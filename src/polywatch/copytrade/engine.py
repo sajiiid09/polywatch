@@ -41,6 +41,12 @@ from .task import Task
 # resolves, and copying into a market that has stopped accepting orders is a guaranteed reject.
 META_TTL_S = 600
 
+# A resting sell above this never fills often enough to be worth tying the shares up in. The
+# fee floor pushes targets upward at prices near 0.50, and widening one past here means the
+# round trip cannot be won at that entry -- which is a reason to stop asking, not to post the
+# order anyway.
+MAX_RESTING_TARGET = 0.97
+
 
 @dataclass
 class RunState:
@@ -265,7 +271,7 @@ class Engine:
         secs_to_close = (meta.get("end_ts") - seen_ts) if meta.get("end_ts") else None
         reason = exits.entry_gates(
             t, price=ev["price"], age_s=age, seconds_to_close=secs_to_close,
-            usd=ev["usdc_size"], accepting_orders=(
+            usd=ev["usdc_size"], fee_rate=self.fee_rate(meta), accepting_orders=(
                 None if meta.get("accepting_orders") is None else bool(meta["accepting_orders"])))
         if reason is None:
             reason = self._portfolio_gates(ev, held)
@@ -376,8 +382,16 @@ class Engine:
         or not this process is alive.
         """
         t = self.task
-        target = t.target_price(pos["avg_price"])
+        rate = self.fee_rate(meta)
+        target = t.target_price(pos["avg_price"], rate)
         if target is None or target >= 1:
+            return
+        # A target that had to be widened past what the market can reach is not a take-profit,
+        # it is an order that will never fill while pinning the shares. Say so and let the
+        # trailing stop and the trader's own exit carry the position instead.
+        if target > MAX_RESTING_TARGET:
+            self.log(f"    take-profit at {target:.3f} is out of reach after fees; "
+                     f"relying on the trailing stop and the trader's exit")
             return
         tick = meta.get("tick_size") or TICK_SIZE_FALLBACK
         r = self.ex.place_resting_sell(pos["token_id"], pos["shares"], target, tick=tick)

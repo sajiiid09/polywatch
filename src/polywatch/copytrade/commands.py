@@ -13,6 +13,7 @@ import os
 from ..config import ENV_FUNDER, ENV_PRIVATE_KEY, MAX_RPS, POLL_TIMEOUT_S
 from ..db import store
 from ..fetch.client import Client
+from . import book as bk
 from . import execution, report
 from .engine import Engine
 from .task import PRESETS, Task, preset
@@ -36,7 +37,8 @@ def _build(args) -> Task:
                          ("slippage", "slippage"), ("trail", "trail_pct"),
                          ("poll", "poll_interval_s"), ("session_hours", "session_hours"),
                          ("max_loss", "max_daily_loss_usd"),
-                         ("max_drawdown", "max_drawdown_pct")):
+                         ("max_drawdown", "max_drawdown_pct"), ("tp_policy", "tp_fee_policy"),
+                         ("min_edge", "min_edge"), ("max_fee_frac", "max_fee_frac")):
         v = getattr(args, flag, None)
         if v is not None:
             over[field_] = v
@@ -69,9 +71,13 @@ def _create(con, args) -> int:
 def _describe(t: Task) -> str:
     sl = "none" if t.sl_kind is None else (f"-{t.sl_value:.0%} off entry" if t.sl_kind == "pct"
                                            else f"at {t.sl_value:.3f}")
-    tp = "none" if t.tp_kind is None else (f"+{t.tp_value:.0%} off entry" if t.tp_kind == "pct"
-                                           else f"at {t.tp_value:.3f}")
-    return "\n".join([
+    tp = ("none -- exits follow the trader, the trail and the stop"
+          if t.tp_kind is None else
+          (f"+{t.tp_value:.0%} off entry" if t.tp_kind == "pct" else f"at {t.tp_value:.3f}"))
+    # The fee floor is price-dependent, so it is shown at a price rather than as a constant.
+    # 0.50 is the worst case and the one that surprises people.
+    floor = bk.round_trip_fee_frac(0.50, 0.05)
+    return "\n".join(x for x in [
         f"  trader        {t.trader}",
         f"  stake         {t.buy_method} "
         + (f"${t.fixed_usd:,.2f}" if t.buy_method == "fixed"
@@ -81,13 +87,21 @@ def _describe(t: Task) -> str:
         + ("  posted as a resting GTC sell -- fills without the bot running"
            if t.resting_tp and t.tp_kind else ""),
         f"  trailing      {t.trail_pct:.0%}" if t.trail_pct else "  trailing      off",
+        f"  fee floor     a round trip costs {floor:.0%} of stake at 0.50, "
+        f"{bk.round_trip_fee_frac(0.85, 0.05):.0%} at 0.85 (5% category)",
+        (f"                targets under that are {t.tp_fee_policy}"
+         + (f"ed to the floor +{t.min_edge:.0%}" if t.tp_fee_policy == "widen"
+            else ("ped as fee_floor" if t.tp_fee_policy == "skip" else " left as set"))
+         ) if t.tp_kind == "pct" else "",
+        f"                entries refused above {t.max_fee_frac:.0%} fee"
+        if t.max_fee_frac else "",
         f"  time stop     {t.max_hold_s / 60:.0f} min",
         f"  follow exits  {'yes' if t.follow_exit else 'no'}",
         f"  poll          {t.poll_interval_s:.0f}s, skip signals older than "
         f"{t.max_signal_age_s}s",
         f"  session       {t.session_hours:.1f}h; breakers -${t.max_daily_loss_usd:,.2f} "
         f"or -{t.max_drawdown_pct:.0%}",
-    ])
+    ] if x)
 
 
 def _list(con, args) -> int:

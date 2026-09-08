@@ -142,3 +142,11 @@ ENV_PRIVATE_KEY = "POLYMARKET_PRIVATE_KEY"
 ENV_FUNDER = "POLYMARKET_FUNDER"        # the proxy/funder address that holds the USDC
 ENV_API_CREDS = ("POLYMARKET_API_KEY", "POLYMARKET_API_SECRET", "POLYMARKET_API_PASSPHRASE")
 CLOB_CHAIN_ID = 137                      # Polygon mainnet
+
+# Fee floor. A round trip costs 2 * rate * min(p, 1-p) / p of the stake -- 10% at even odds in
+# a 5% category, under 1% near the extremes -- so a percentage take-profit under that number
+# cannot be reached profitably however the trade goes. MIN_EDGE is the margin demanded on top
+# of the floor; MAX_FEE_FRAC refuses the entry outright when the fee alone would eat this much
+# of the stake, which no exit rule can undo.
+DEFAULT_MIN_EDGE = 0.02
+DEFAULT_MAX_FEE_FRAC = 0.12

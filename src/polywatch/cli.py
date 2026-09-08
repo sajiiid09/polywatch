@@ -111,6 +111,13 @@ def main(argv=None) -> int:
     tc.add_argument("--take-profit", type=float, default=None,
                     help="fraction above entry, e.g. 0.10; 0 disables")
     tc.add_argument("--trail", type=float, default=None, help="trailing stop fraction; 0 off")
+    tc.add_argument("--tp-policy", choices=("widen", "skip", "off"), default=None,
+                    help="what to do when the take-profit is under the round-trip fee: widen "
+                         "it to clear the fees (default), skip the trade, or leave it alone")
+    tc.add_argument("--min-edge", type=float, default=None,
+                    help="margin demanded on top of the fee floor, e.g. 0.02")
+    tc.add_argument("--max-fee-frac", type=float, default=None,
+                    help="refuse entries whose round-trip fee exceeds this share of the stake")
     tc.add_argument("--max-hold-min", type=float, default=None)
     tc.add_argument("--poll", type=float, default=None, help="seconds between polls")
     tc.add_argument("--session-hours", type=float, default=None)

@@ -159,3 +159,28 @@ def net_exit_value(book: dict, shares: float, rate: float,
     w = sell_shares(book, shares)
     f = fee(w.shares, w.vwap, rate, exponent) if w.filled else 0.0
     return w.cost, f, w.cost - f
+
+
+def round_trip_fee_frac(price: float, rate: float,
+                        exponent: float = FEE_EXPONENT_DEFAULT) -> float:
+    """Both taker fees on a round trip, as a fraction of the stake.
+
+    This is the number that decides whether a copy can make money at all, and it is not
+    intuitive: the fee is proportional to min(p, 1-p) but the shares a fixed stake buys are
+    proportional to 1/p, so the cost of a round trip runs from 10% of stake at even odds down
+    to under 1% near the extremes. A 5% take-profit at 0.50 is arithmetically incapable of
+    clearing it -- which is a property of the market, not of the trader being copied.
+
+    Both legs are priced at the entry, so this is the fee on a flat round trip. A winning exit
+    that moves toward 0.50 pays slightly more and one that moves away pays slightly less; the
+    error is second-order next to the decision it informs.
+    """
+    if not (0 < price < 1) or rate <= 0:
+        return 0.0
+    return 2 * rate * (min(price, 1 - price) ** exponent) / price
+
+
+def min_viable_target(price: float, rate: float, margin: float = 0.0,
+                      exponent: float = FEE_EXPONENT_DEFAULT) -> float:
+    """The smallest take-profit that clears both fees, plus whatever margin is wanted."""
+    return round_trip_fee_frac(price, rate, exponent) + margin

@@ -17,8 +17,10 @@ from __future__ import annotations
 import json
 from dataclasses import asdict, dataclass, field, fields
 
+from . import book as bk
 from ..config import (DEFAULT_BANKROLL_USD, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_DAILY_LOSS_USD,
-                      DEFAULT_MAX_DRAWDOWN_PCT, DEFAULT_MAX_HOLD_S, DEFAULT_MAX_MARKET_USD,
+                      DEFAULT_MAX_DRAWDOWN_PCT, DEFAULT_MAX_FEE_FRAC, DEFAULT_MAX_HOLD_S,
+                      DEFAULT_MAX_MARKET_USD, DEFAULT_MIN_EDGE,
                       DEFAULT_SLIPPAGE, DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT,
                       DEFAULT_TRAIL_PCT, MAX_ENTRY_PRICE, MAX_SIGNAL_AGE_S, MIN_ENTRY_PRICE,
                       MIN_SECONDS_TO_CLOSE, POLL_INTERVAL_S, SESSION_MAX_HOURS)
@@ -48,6 +50,20 @@ class Task:
     sl_value: float | None = DEFAULT_STOP_LOSS_PCT
     tp_kind: str | None = "pct"
     tp_value: float | None = DEFAULT_TAKE_PROFIT_PCT
+    # A percentage take-profit is meaningless until it clears both taker fees, and what it has
+    # to clear depends on the entry price: a round trip costs 10% of stake at 0.50 and 1% at
+    # 0.90. `tp_fee_policy` says what to do when the configured target is under that floor.
+    #   'widen' -- raise the target to the floor plus `min_edge`. The default: the trade is
+    #             still worth taking, it just cannot be exited at the price we asked for.
+    #   'skip'  -- refuse the trade, counted as `fee_floor`. Use when the target is a thesis
+    #             about how far the price moves, not an arbitrary number.
+    #   'off'   -- leave the target where it was set. Only sane with follow_exit on.
+    tp_fee_policy: str = "widen"
+    min_edge: float = DEFAULT_MIN_EDGE      # margin over the fee floor, in price fraction
+    # Refuse any entry whose round-trip fee exceeds this share of the stake, whatever the
+    # target. Near 0.50 in a 7% category the fee alone is 14% of stake, and no exit rule
+    # recovers that.
+    max_fee_frac: float = DEFAULT_MAX_FEE_FRAC
     trail_pct: float = DEFAULT_TRAIL_PCT    # 0 disables
     max_hold_s: int = DEFAULT_MAX_HOLD_S
     # Post the take-profit as a resting GTC limit sell on the exchange instead of watching for
@@ -87,6 +103,9 @@ class Task:
             raise ValueError(f"mode must be paper or live, got {self.mode!r}")
         if self.buy_method not in ("fixed", "mirror"):
             raise ValueError(f"buy_method must be fixed or mirror, got {self.buy_method!r}")
+        if self.tp_fee_policy not in ("widen", "skip", "off"):
+            raise ValueError(f"tp_fee_policy must be widen, skip or off, "
+                             f"got {self.tp_fee_policy!r}")
         for kind_attr in ("sl_kind", "tp_kind"):
             k = getattr(self, kind_attr)
             if k not in (None, "pct", "price"):
@@ -142,21 +161,52 @@ class Task:
             return None
         return avg_price * (1 - self.sl_value) if self.sl_kind == "pct" else self.sl_value
 
-    def target_price(self, avg_price: float) -> float | None:
+    def target_price(self, avg_price: float, fee_rate: float | None = None) -> float | None:
+        """The take-profit level, raised to clear both fees when it has to be.
+
+        An absolute ('price') target is returned as given -- it is a statement about where the
+        market is going, and moving it would be answering a different question. A percentage
+        target is relative to our own entry, so widening it to the fee floor keeps it meaning
+        what it was meant to mean: the smallest win worth taking.
+        """
         if self.tp_kind is None or self.tp_value is None:
             return None
-        return avg_price * (1 + self.tp_value) if self.tp_kind == "pct" else self.tp_value
+        if self.tp_kind == "price":
+            return self.tp_value
+        pct = self.tp_value
+        if fee_rate is not None and self.tp_fee_policy == "widen":
+            pct = max(pct, bk.min_viable_target(avg_price, fee_rate, self.min_edge))
+        return avg_price * (1 + pct)
+
+    def target_is_viable(self, price: float, fee_rate: float) -> bool:
+        """Can the configured percentage target clear the round trip at this price?"""
+        if self.tp_kind != "pct" or self.tp_value is None:
+            return True
+        return self.tp_value >= bk.min_viable_target(price, fee_rate, self.min_edge) - 1e-9
 
 
+# No take-profit, deliberately. Measured on 374 matched round trips from a live quick-flip
+# wallet on 2026-09-08: their flips returned a median of +15% but a p75 of +68% and a p90 of
+# +194%, and a fixed target truncates exactly the tail that pays for the losers. Simulated over
+# 30k fifteen-minute windows at $10 a copy, an +8% target returned -$0.68 a session and a target
+# widened to clear the fees still returned -$0.57, while following the trader out of the
+# position returned +$6.59. The trader's own exit is the edge being copied; a target is a
+# different, worse strategy wearing the same clothes.
+#
+# The floor under that is the stop, the trailing stop and the time stop, all of which need this
+# process running. Set --take-profit to get a resting GTC sell instead: it caps the upside, and
+# it is the right trade when the alternative is leaving the position unwatched.
 QUICK_FLIP = dict(hold="quick_flips", max_hold_s=2700, max_signal_age_s=120,
-                  poll_interval_s=15.0, trail_pct=0.06, follow_exit=True)
+                  poll_interval_s=15.0, trail_pct=0.06, follow_exit=True,
+                  tp_kind=None, tp_value=None)
 
 # Looser everything: a position meant to be held for hours cannot have a 45-minute time stop or
 # a 6% trailing exit, and following the trader out matters less when their exit is a day away.
 # This preset exists so the same machinery can babysit a manual idea, not because the poller is
 # any good at finding one.
 SLOW_HOLD = dict(hold="hours", max_hold_s=6 * 3600, max_signal_age_s=900,
-                 poll_interval_s=30.0, trail_pct=0.0, sl_value=0.25, tp_value=0.30)
+                 poll_interval_s=30.0, trail_pct=0.0, sl_value=0.25,
+                 tp_kind="pct", tp_value=0.30)
 
 PRESETS = {"quick_flips": QUICK_FLIP, "hours": SLOW_HOLD}
 

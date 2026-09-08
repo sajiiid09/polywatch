@@ -278,8 +278,11 @@ def test_a_trade_we_noticed_too_late_is_skipped_and_the_reason_is_recorded(con):
 
 
 def test_a_copied_buy_leaves_a_resting_take_profit_on_the_book(con):
+    """Opt-in: the quick-flip preset ships without a target, because capping the upside is
+    what made copying this pattern lose money. Setting one turns the resting order back on."""
     books = {"tok": {"bids": [(0.49, 1000)], "asks": [(0.51, 1000)]}}
-    eng, _ = engine_for(con, [activity_event()], books)
+    t = Task(name="t", trader="0xtrader", tp_kind="pct", tp_value=0.10, resting_tp=True)
+    eng, _ = engine_for(con, [activity_event()], books, task=t)
     eng.poll_signals()
     resting = store.open_resting(con, eng.state.run_id)
     assert len(resting) == 1
@@ -289,7 +292,8 @@ def test_a_copied_buy_leaves_a_resting_take_profit_on_the_book(con):
 
 def test_the_resting_take_profit_closes_the_position_when_the_bid_reaches_it(con):
     books = {"tok": {"bids": [(0.49, 1000)], "asks": [(0.51, 1000)]}}
-    eng, fake = engine_for(con, [activity_event()], books)
+    t = Task(name="t", trader="0xtrader", tp_kind="pct", tp_value=0.10, resting_tp=True)
+    eng, fake = engine_for(con, [activity_event()], books, task=t)
     eng.poll_signals()
     fake.books["tok"] = {"bids": [(0.70, 1000)], "asks": [(0.71, 1000)]}
     eng.manage_positions()
@@ -382,3 +386,99 @@ def test_a_task_saved_by_an_older_version_still_loads(con):
     loaded = Task.from_row(con.execute("SELECT * FROM tasks WHERE name='t'").fetchone())
     assert loaded.fixed_usd == 7 and loaded.trader == "0xtrader"
     assert loaded.max_hold_s == Task(name="x", trader="0x1").max_hold_s
+
+
+# --- the fee floor --------------------------------------------------------
+# A round trip costs 2 * rate * min(p, 1-p) / p of the stake. Near 0.50 that is a tenth of the
+# stake, which is more than the take-profit the bot shipped with could ever win back.
+
+
+def test_the_round_trip_fee_is_worst_at_even_odds_and_trivial_at_the_extremes():
+    assert bk.round_trip_fee_frac(0.50, 0.05) == pytest.approx(0.10)
+    assert bk.round_trip_fee_frac(0.90, 0.05) == pytest.approx(0.0111, abs=1e-4)
+    assert bk.round_trip_fee_frac(0.20, 0.05) == pytest.approx(0.10)
+
+
+def test_a_percentage_target_is_widened_to_clear_the_fees():
+    """+8% at 0.56 nets +0.9% and risks the full stop. The target moves; the trade stays."""
+    t = Task(name="a", trader="0x1", tp_value=0.08, min_edge=0.02)
+    assert t.target_is_viable(0.56, 0.05) is False
+    widened = t.target_price(0.56, 0.05) / 0.56 - 1
+    assert widened == pytest.approx(bk.round_trip_fee_frac(0.56, 0.05) + 0.02)
+    # Where the fee is small the configured target is already enough and is left alone.
+    assert t.target_price(0.90, 0.05) == pytest.approx(0.90 * 1.08)
+
+
+def test_an_absolute_target_is_never_moved():
+    """'sell at 0.62' is a claim about the market; widening it would answer a different one."""
+    t = Task(name="a", trader="0x1", tp_kind="price", tp_value=0.62)
+    assert t.target_price(0.50, 0.07) == 0.62
+
+
+def test_the_skip_policy_refuses_the_trade_instead_of_moving_the_target():
+    t = Task(name="a", trader="0x1", tp_value=0.08, tp_fee_policy="skip")
+    base = dict(price=0.56, age_s=5, seconds_to_close=99999, usd=100.0, accepting_orders=True)
+    assert exits.entry_gates(t, fee_rate=0.05, **base) == "fee_floor"
+    assert exits.entry_gates(t, fee_rate=0.005, **base) is None
+
+
+def test_the_off_policy_leaves_a_target_that_cannot_pay_for_itself():
+    """Only sane alongside follow_exit, and it stays available because 'the bot silently
+    changed my number' is worse than a number the operator chose."""
+    t = Task(name="a", trader="0x1", tp_value=0.08, tp_fee_policy="off")
+    assert t.target_price(0.56, 0.05) == pytest.approx(0.56 * 1.08)
+
+
+def test_an_entry_whose_fee_alone_eats_the_stake_is_refused_whatever_the_target():
+    t = Task(name="a", trader="0x1", max_fee_frac=0.12)
+    base = dict(price=0.50, age_s=5, seconds_to_close=99999, usd=100.0, accepting_orders=True)
+    assert exits.entry_gates(t, fee_rate=0.07, **base) == "fee_floor"   # 14% of stake
+    assert exits.entry_gates(t, fee_rate=0.05, **base) is None          # 10%, allowed
+
+
+def test_the_gate_is_unchanged_when_the_fee_rate_is_unknown():
+    t = Task(name="a", trader="0x1")
+    assert exits.entry_gates(t, price=0.50, age_s=5, seconds_to_close=99999, usd=100.0,
+                             accepting_orders=True) is None
+
+
+def test_the_ladder_checks_the_same_widened_target_the_order_was_priced_at(con):
+    """Otherwise the watched target and the resting target are two different numbers."""
+    t = Task(name="a", trader="0x1", tp_value=0.08, resting_tp=False, sl_kind=None,
+             trail_pct=0)
+    pos = position(avg_price=0.56, cost_usd=56.0)
+    b = book_of([(0.605, 1000)], [(0.61, 1000)])        # +8% but under the widened target
+    assert exits.check(t, pos, b, fee_rate=0.05, now=1).exit is False
+    b = book_of([(0.64, 1000)], [(0.65, 1000)])
+    assert exits.check(t, pos, b, fee_rate=0.05, now=1).reason == exits.TAKE_PROFIT
+
+
+def test_a_target_the_fees_push_out_of_reach_is_not_posted_at_all(con):
+    """Posting it would pin the shares behind an order that never fills."""
+    books = {"tok": {"bids": [(0.93, 1000)], "asks": [(0.94, 1000)]}}
+    t = Task(name="t", trader="0xtrader", tp_value=0.10, max_price=0.99, max_fee_frac=0.5)
+    eng, _ = engine_for(con, [activity_event(price=0.94)], books, task=t)
+    eng.poll_signals()
+    assert store.open_positions(con, eng.state.run_id)      # the position was still taken
+    assert not store.open_resting(con, eng.state.run_id)    # but no doomed order was posted
+
+
+def test_a_copy_priced_where_fees_eat_it_is_skipped_and_named(con):
+    books = {"tok": {"bids": [(0.49, 1000)], "asks": [(0.51, 1000)]}}
+    t = Task(name="t", trader="0xtrader", max_fee_frac=0.05)
+    eng, _ = engine_for(con, [activity_event()], books, task=t)
+    eng.poll_signals()
+    assert store.skip_reasons(con, eng.state.run_id) == [("fee_floor", 1)]
+
+
+def test_the_quick_flip_preset_ships_without_a_take_profit(con):
+    """Measured: an +8% target lost money on a real quick-flip wallet's own flips, and even a
+    fee-widened one did, because the wins that pay for the losers are in the tail."""
+    t = Task(name="t", trader="0x1", **preset("quick_flips"))
+    assert t.tp_kind is None and t.follow_exit and t.trail_pct > 0
+    assert t.stop_price(0.50) is not None       # the floor is still there
+    books = {"tok": {"bids": [(0.49, 1000)], "asks": [(0.51, 1000)]}}
+    eng, _ = engine_for(con, [activity_event()], books, task=t)
+    eng.poll_signals()
+    assert store.open_positions(con, eng.state.run_id)
+    assert not store.open_resting(con, eng.state.run_id)

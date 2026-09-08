@@ -78,7 +78,7 @@ def check(task, position, book: dict, *, fee_rate: float, now: int,
     if stop is not None and m.net_price <= stop:
         return Decision(True, STOP_LOSS, f"net {m.net_price:.3f} <= stop {stop:.3f}")
 
-    target = task.target_price(avg)
+    target = task.target_price(avg, fee_rate)
     if target is not None and not task.resting_tp and m.net_price >= target:
         return Decision(True, TAKE_PROFIT, f"net {m.net_price:.3f} >= target {target:.3f}")
 
@@ -118,12 +118,15 @@ def breaker(task, start_bankroll: float, realized_pnl: float, unrealized_pnl: fl
 
 
 def entry_gates(task, *, price: float, age_s: int, seconds_to_close: int | None,
-                usd: float, accepting_orders: bool | None) -> str | None:
+                usd: float, accepting_orders: bool | None,
+                fee_rate: float | None = None) -> str | None:
     """Why not to copy this trade. Returns a skip reason, or None to proceed.
 
     The reasons are deliberately coarse and few: they become the histogram that `task report`
     prints, and that histogram is the main finding of a paper run. 'stale' dominating means the
-    trader is too fast to copy; 'price_band' dominating means the fee model is refusing them.
+    trader is too fast to copy; 'price_band' dominating means their entries sit where the book
+    is thin; 'fee_floor' dominating means the round trip costs more than the exit rule can win
+    back, which is a verdict on the market rather than on the trader.
     """
     if age_s > task.max_signal_age_s:
         return "stale"
@@ -131,6 +134,16 @@ def entry_gates(task, *, price: float, age_s: int, seconds_to_close: int | None,
         return "trade_too_small"
     if not (task.min_price <= price <= task.max_price):
         return "price_band"
+    if fee_rate is not None:
+        # The fee alone, before anything is won or lost. Near 0.50 in an expensive category it
+        # can exceed a tenth of the stake, and no exit rule recovers that.
+        if task.max_fee_frac > 0 and \
+                bk.round_trip_fee_frac(price, fee_rate) > task.max_fee_frac:
+            return "fee_floor"
+        # And the configured target has to be able to clear it. Under 'widen' the target moves
+        # instead, so there is nothing to refuse.
+        if task.tp_fee_policy == "skip" and not task.target_is_viable(price, fee_rate):
+            return "fee_floor"
     if accepting_orders is False:
         return "not_accepting_orders"
     if seconds_to_close is not None and seconds_to_close < task.min_seconds_to_close:
