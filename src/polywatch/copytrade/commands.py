@@ -28,7 +28,30 @@ def dispatch(args) -> int:
     }[args.task_cmd](con, args)
 
 
-def _build(args) -> Task:
+def _roster(con, args) -> list[str]:
+    """The wallets this task will copy, from --trader, --from-shortlist, or both.
+
+    A roster taken from the shortlist never includes an excluded wallet: exclusion is a
+    statement that the wallet is not a candidate, and quietly copying one because it ranked
+    highly among the rejects would undo the point of ranking.
+    """
+    out = [a.lower() for a in (args.trader or [])]
+    n = getattr(args, "from_shortlist", None)
+    if n:
+        floor = args.min_rank_score or 0.0
+        rows = store.top_trader_scores(con, limit=n * 3)
+        picked = [r["address"] for r in rows if (r["rank_score"] or 0.0) >= floor][:n]
+        if not picked:
+            raise SystemExit(
+                "no wallets in the shortlist clear that floor.\n"
+                "Run `polywatch discover` first, or lower --min-rank-score.")
+        out += [a for a in picked if a not in out]
+    if not out:
+        raise SystemExit("name at least one --trader, or use --from-shortlist N")
+    return out
+
+
+def _build(con, args) -> Task:
     """Flags -> Task. Unset flags fall through to the preset, then to the dataclass default."""
     over: dict = {}
     if args.mirror:
@@ -40,7 +63,10 @@ def _build(args) -> Task:
                          ("max_drawdown", "max_drawdown_pct"), ("tp_policy", "tp_fee_policy"),
                          ("min_edge", "min_edge"), ("max_fee_frac", "max_fee_frac"),
                          ("max_spread_frac", "max_spread_frac"),
-                         ("min_depth_usd", "min_depth_usd")):
+                         ("min_depth_usd", "min_depth_usd"),
+                         ("per_trader_usd", "per_trader_usd"),
+                         ("auto_drop_usd", "auto_drop_usd"),
+                         ("min_rank_score", "min_rank_score")):
         v = getattr(args, flag, None)
         if v is not None:
             over[field_] = v
@@ -58,13 +84,15 @@ def _build(args) -> Task:
         over["follow_exit"] = False
     if args.no_flatten:
         over["flatten_on_stop"] = False
-    return Task(name=args.name, trader=args.trader, bankroll=args.bankroll,
+    roster = _roster(con, args)
+    return Task(name=args.name, trader=roster[0], traders=roster, bankroll=args.bankroll,
                 fixed_usd=args.stake, **preset(args.preset, **over))
 
 
 def _create(con, args) -> int:
-    t = _build(args)
+    t = _build(con, args)
     store.upsert_task(con, t.as_row())
+    store.set_task_traders(con, t.name, [{"address": a} for a in t.traders])
     print(f"task {t.name} saved ({t.hold} preset, {t.mode} mode)")
     print(_describe(t))
     return 0
@@ -79,8 +107,13 @@ def _describe(t: Task) -> str:
     # The fee floor is price-dependent, so it is shown at a price rather than as a constant.
     # 0.50 is the worst case and the one that surprises people.
     floor = bk.round_trip_fee_frac(0.50, 0.05)
+    who = ([f"  trader        {t.trader}"] if len(t.traders) == 1 else
+           [f"  traders       {len(t.traders)}, up to ${t.per_trader_cap:,.2f} of risk each"]
+           + [f"                {a}" for a in t.traders]
+           + ([f"                dropped once down ${t.auto_drop_usd:,.2f}"]
+              if t.auto_drop_usd else []))
     return "\n".join(x for x in [
-        f"  trader        {t.trader}",
+        *who,
         f"  stake         {t.buy_method} "
         + (f"${t.fixed_usd:,.2f}" if t.buy_method == "fixed"
            else f"up to {t.mirror_max_frac:.0%} of ${t.bankroll:,.2f}"),

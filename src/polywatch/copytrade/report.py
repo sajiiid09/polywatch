@@ -91,6 +91,8 @@ def run_report(con, run_id: int, task=None) -> str:
                          f"{p['avg_price']:7.3f} {p['realized_pnl']:+9.2f} {held:6.0f}m  "
                          f"{p['close_reason'] or ''}")
 
+    lines += trader_block(con, run_id, task)
+
     rest = con.execute(
         "SELECT * FROM resting_orders WHERE run_id=? AND status='open'", (run_id,)).fetchall()
     if rest:
@@ -99,6 +101,31 @@ def run_report(con, run_id: int, task=None) -> str:
             lines.append(f"    {r['shares']:.1f} @ {r['price']:.3f}  {r['token_id'][:12]}"
                          f"  {r['exchange_id'] or '(paper)'}")
     return "\n".join(x for x in lines if x != "")
+
+
+def trader_block(con, run_id: int, task=None) -> list[str]:
+    """Per-trader attribution. The reason a portfolio run is worth running.
+
+    Copying several wallets on one bankroll is only diversification if a bad one can be
+    identified afterwards. Without this the run reports a single number and the wallet that lost
+    the money hides inside it.
+    """
+    by = store.trader_pnl(con, run_id)
+    if len(by) <= 1:
+        return []
+    dropped = {}
+    if task is not None:
+        dropped = {r["address"]: r["dropped_reason"]
+                   for r in store.task_traders(con, task.name) if not r["active"]}
+    lines = ["", "  by trader",
+             f"    {'wallet':<14} {'signals':>7} {'copied':>6} {'pos':>4} {'open':>5} "
+             f"{'pnl':>9} {'fees':>7}"]
+    for addr, d in sorted(by.items(), key=lambda kv: -kv[1]["realized_pnl"]):
+        lines.append(f"    {addr[:14]:<14} {d['signals']:7} {d['copied']:6} "
+                     f"{d['positions']:4} {d['open']:5} {d['realized_pnl']:+9.2f} "
+                     f"{d['fees']:7.2f}"
+                     + (f"   DROPPED: {dropped[addr]}" if addr in dropped else ""))
+    return lines
 
 
 def exit_mix(con, run_id: int) -> list[tuple[str, int, float]]:

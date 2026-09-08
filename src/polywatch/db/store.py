@@ -71,6 +71,11 @@ def init_db(con: sqlite3.Connection) -> None:
         if col not in have:
             con.execute(f"ALTER TABLE market_meta ADD COLUMN {col} {decl}")
     # ...and before a score card could say whether the wallet's edge survives being copied.
+    # ...and before a run could copy more than one wallet at a time.
+    for table in ("positions", "orders"):
+        have = {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}
+        if "trader" not in have:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN trader TEXT")
     have = {r["name"] for r in con.execute("PRAGMA table_info(trader_scores)")}
     for col, decl in (("capture_ratio", "REAL"), ("edge_half_life_s", "REAL"),
                       ("hold_p50_s", "INTEGER"), ("fee_adjusted_roi", "REAL"),
@@ -335,6 +340,81 @@ def delete_task(con: sqlite3.Connection, name: str) -> int:
     return n
 
 
+# --- the traders a task copies --------------------------------------------
+
+
+def set_task_traders(con: sqlite3.Connection, task: str, rows: list[dict]) -> int:
+    """Replace a task's roster. Editing a task's traders is a deliberate act, not a merge."""
+    now = int(time.time())
+    con.execute("DELETE FROM task_traders WHERE task=?", (task,))
+    con.executemany(
+        """INSERT INTO task_traders (task, address, weight, rank_score, active, added_ts)
+           VALUES (?,?,?,?,1,?)""",
+        [(task, r["address"].lower(), r.get("weight", 1.0), r.get("rank_score"), now)
+         for r in rows])
+    con.commit()
+    return len(rows)
+
+
+def task_traders(con: sqlite3.Connection, task: str, active_only: bool = False
+                 ) -> list[sqlite3.Row]:
+    sql = "SELECT * FROM task_traders WHERE task=?"
+    if active_only:
+        sql += " AND active=1"
+    return con.execute(sql + " ORDER BY weight DESC, address", (task,)).fetchall()
+
+
+def drop_task_trader(con: sqlite3.Connection, task: str, address: str, reason: str) -> None:
+    """Stop copying one wallet. Their open positions are still managed to the end of the run --
+    dropping a trader is a decision to stop taking their advice, not to abandon their trades."""
+    con.execute(
+        "UPDATE task_traders SET active=0, dropped_reason=? WHERE task=? AND address=?",
+        (reason, task, address.lower()))
+    con.commit()
+
+
+def trader_pnl(con: sqlite3.Connection, run_id: int) -> dict[str, dict]:
+    """Per-trader attribution for one run: what each wallet's signals actually earned.
+
+    The point of copying several traders is being able to tell them apart afterwards. Without
+    this a portfolio run reports one number and the bad wallet hides inside it.
+    """
+    out: dict[str, dict] = {}
+    for r in con.execute(
+        """SELECT COALESCE(trader,'?') t, COUNT(*) n,
+                  COALESCE(SUM(realized_pnl),0) pnl,
+                  COALESCE(SUM(fees_paid),0) + COALESCE(SUM(fees_realized),0) fees,
+                  SUM(CASE WHEN open=1 THEN 1 ELSE 0 END) still_open,
+                  COALESCE(SUM(CASE WHEN open=1 THEN cost_usd + fees_paid ELSE 0 END),0) tied
+           FROM positions WHERE run_id=? GROUP BY COALESCE(trader,'?')""", (run_id,)):
+        out[r[0]] = {"positions": int(r[1]), "realized_pnl": float(r[2]),
+                     "fees": float(r[3]), "open": int(r[4]), "exposure": float(r[5]),
+                     "signals": 0, "copied": 0}
+    for r in con.execute(
+        """SELECT trader, COUNT(*), SUM(CASE WHEN action='copied' THEN 1 ELSE 0 END)
+           FROM signals WHERE run_id=? GROUP BY trader""", (run_id,)):
+        row = out.setdefault(r[0], {"positions": 0, "realized_pnl": 0.0, "fees": 0.0,
+                                    "open": 0, "exposure": 0.0, "signals": 0, "copied": 0})
+        row["signals"] = int(r[1])
+        row["copied"] = int(r[2] or 0)
+    return out
+
+
+def trader_exposure(con: sqlite3.Connection, run_id: int, trader: str) -> float:
+    """Open cost across every position one trader's signals opened."""
+    row = con.execute(
+        """SELECT COALESCE(SUM(cost_usd + fees_paid), 0) FROM positions
+           WHERE run_id=? AND trader=? AND open=1""", (run_id, trader.lower())).fetchone()
+    return float(row[0])
+
+
+def trader_realized(con: sqlite3.Connection, run_id: int, trader: str) -> float:
+    row = con.execute(
+        "SELECT COALESCE(SUM(realized_pnl), 0) FROM positions WHERE run_id=? AND trader=?",
+        (run_id, trader.lower())).fetchone()
+    return float(row[0])
+
+
 def start_run(con: sqlite3.Connection, task: str, mode: str, bankroll: float) -> int:
     cur = con.execute(
         "INSERT INTO task_runs (task, mode, started_at, start_bankroll) VALUES (?,?,?,?)",
@@ -445,11 +525,13 @@ def skip_reasons(con: sqlite3.Connection, run_id: int) -> list[tuple[str, int]]:
 def insert_order(con: sqlite3.Connection, row: dict) -> int:
     row.setdefault("ts", int(time.time()))
     row.setdefault("exchange_id", None)
+    row.setdefault("trader", None)
     cur = con.execute(
         """INSERT INTO orders
-               (run_id, signal_id, mode, token_id, condition_id, side, intent_usd, limit_price,
-                book_vwap, filled_shares, avg_price, fee, status, exchange_id, reason, ts)
-           VALUES (:run_id,:signal_id,:mode,:token_id,:condition_id,:side,:intent_usd,
+               (run_id, signal_id, trader, mode, token_id, condition_id, side, intent_usd,
+                limit_price, book_vwap, filled_shares, avg_price, fee, status, exchange_id,
+                reason, ts)
+           VALUES (:run_id,:signal_id,:trader,:mode,:token_id,:condition_id,:side,:intent_usd,
                 :limit_price,:book_vwap,:filled_shares,:avg_price,:fee,:status,:exchange_id,
                 :reason,:ts)""",
         row,
@@ -494,12 +576,13 @@ def recorded_shares(con: sqlite3.Connection, run_id: int, token_id: str) -> floa
 
 def open_position(con: sqlite3.Connection, row: dict) -> int:
     row.setdefault("opened_ts", int(time.time()))
+    row.setdefault("trader", None)
     cur = con.execute(
         """INSERT INTO positions
-               (run_id, token_id, condition_id, shares, avg_price, cost_usd, fees_paid,
+               (run_id, trader, token_id, condition_id, shares, avg_price, cost_usd, fees_paid,
                 opened_ts, open)
-           VALUES (:run_id,:token_id,:condition_id,:shares,:avg_price,:cost_usd,:fees_paid,
-                :opened_ts,1)""",
+           VALUES (:run_id,:trader,:token_id,:condition_id,:shares,:avg_price,:cost_usd,
+                :fees_paid,:opened_ts,1)""",
         row,
     )
     con.commit()

@@ -248,7 +248,7 @@ def engine_for(con, feed, books, task=None, now=1010):
     t = task or Task(name="t", trader="0xtrader", **preset("quick_flips"))
     _task(con, t)
     eng = Engine(con, t, PaperExecutor(), client=None, log=lambda *a: None, now=lambda: now)
-    eng._trader_account = lambda: 10_000.0
+    eng._trader_account = lambda _a: 10_000.0
     eng.start()
     return eng, fake
 
@@ -551,7 +551,7 @@ def test_a_live_run_that_cannot_verify_what_it_holds_refuses_to_start(con):
     engine_mod.api = FakeAPI([], {})
     t = _task(con, Task(name="t", trader="0xtrader"))
     eng = Engine(con, t, BlindExchange(), client=None, log=lambda *a: None, now=lambda: 1000)
-    eng._trader_account = lambda: 0.0
+    eng._trader_account = lambda _a: 0.0
 
     with pytest.raises(ReconcileError):
         eng.start()

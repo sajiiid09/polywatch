@@ -148,6 +148,21 @@ CREATE TABLE IF NOT EXISTS tasks (
     config_json     TEXT NOT NULL
 );
 
+-- Which wallets a task copies. A task copying one trader bets the whole account on one
+-- person's judgement, and the ordinary way a copy bot ends is that the person tilts. A row per
+-- (task, trader) lets one bankroll follow several, with a per-trader cap and per-trader
+-- attribution, so a wallet that stops working can be identified rather than merely suspected.
+CREATE TABLE IF NOT EXISTS task_traders (
+    task           TEXT NOT NULL REFERENCES tasks(name),
+    address        TEXT NOT NULL,
+    weight         REAL NOT NULL DEFAULT 1.0,   -- from rank_score at the time it was added
+    rank_score     REAL,
+    active         INTEGER NOT NULL DEFAULT 1,  -- 0 once auto-dropped; positions still managed
+    dropped_reason TEXT,
+    added_ts       INTEGER NOT NULL,
+    PRIMARY KEY (task, address)
+);
+
 CREATE TABLE IF NOT EXISTS task_runs (
     id             INTEGER PRIMARY KEY,
     task           TEXT NOT NULL REFERENCES tasks(name),
@@ -192,6 +207,7 @@ CREATE TABLE IF NOT EXISTS orders (
     id            INTEGER PRIMARY KEY,
     run_id        INTEGER NOT NULL REFERENCES task_runs(id),
     signal_id     INTEGER REFERENCES signals(id),   -- NULL for our own exits
+    trader        TEXT,                     -- whose signal this order serves
     mode          TEXT NOT NULL,            -- 'paper' | 'live'
     token_id      TEXT NOT NULL,
     condition_id  TEXT NOT NULL,
@@ -216,6 +232,9 @@ CREATE INDEX IF NOT EXISTS idx_orders_unknown ON orders(run_id, status) WHERE st
 CREATE TABLE IF NOT EXISTS positions (
     id            INTEGER PRIMARY KEY,
     run_id        INTEGER NOT NULL REFERENCES task_runs(id),
+    -- Whose signal opened this. Attribution, the per-trader exposure cap, and deciding whose
+    -- sell we should follow out of it all key on this.
+    trader        TEXT,
     token_id      TEXT NOT NULL,
     condition_id  TEXT NOT NULL,
     shares        REAL NOT NULL,

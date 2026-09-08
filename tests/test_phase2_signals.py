@@ -120,9 +120,9 @@ def test_a_busy_trader_is_read_past_the_first_page(con):
     t = Task(name="t", trader="0xtrader", **preset("quick_flips"))
     store.upsert_task(con, t.as_row())
     eng = Engine(con, t, PaperExecutor(), client=None, log=lambda *a: None, now=lambda: 1200)
-    eng._trader_account = lambda: 0.0
+    eng._trader_account = lambda _a: 0.0
     eng.start()
-    eng.state.last_seen_ts = 900
+    eng.state.last_seen["0xtrader"] = 900
 
     eng.poll_signals()
     assert fake.pages_read > 1
@@ -139,9 +139,9 @@ def test_a_read_that_hits_the_page_cap_is_counted_rather_than_swallowed(con):
     t = Task(name="t", trader="0xtrader", **preset("quick_flips"))
     store.upsert_task(con, t.as_row())
     eng = Engine(con, t, PaperExecutor(), client=None, log=lambda *a: None, now=lambda: 9999)
-    eng._trader_account = lambda: 0.0
+    eng._trader_account = lambda _a: 0.0
     eng.start()
-    eng.state.last_seen_ts = 1
+    eng.state.last_seen["0xtrader"] = 1
 
     eng.poll_signals()
     assert eng.state.truncated_polls == 1
@@ -155,20 +155,20 @@ def test_the_watermark_stays_behind_an_event_that_could_not_be_handled(con):
             activity_event(transactionHash="0xb", timestamp=1001),
             activity_event(transactionHash="0xc", timestamp=1002)]
     eng, _ = engine_for(con, feed, books)
-    eng.state.last_seen_ts = 999
+    eng.state.last_seen["0xtrader"] = 999
 
     calls = {"n": 0}
     real = eng.handle_event
 
-    def flaky(ev, seen_ts, fetch_ts=None):
+    def flaky(ev, seen_ts, fetch_ts=None, trader=None):
         calls["n"] += 1
         if ev["tx_hash"] == "0xb":
             raise RuntimeError("upstream shape changed")
-        return real(ev, seen_ts, fetch_ts)
+        return real(ev, seen_ts, fetch_ts, trader)
 
     eng.handle_event = flaky
     eng.poll_signals()
-    assert eng.state.last_seen_ts == 1000, "the watermark must not pass the event that failed"
+    assert eng.state.last_seen["0xtrader"] == 1000, "the watermark must not pass the event that failed"
     assert eng.state.errors == 1
 
 

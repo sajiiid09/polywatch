@@ -116,7 +116,18 @@ def main(argv=None) -> int:
 
     tc = tsub.add_parser("create", help="create or update a task")
     tc.add_argument("name")
-    tc.add_argument("--trader", required=True, help="wallet to copy")
+    tc.add_argument("--trader", action="append", default=None,
+                    help="wallet to copy; repeat to copy several on one bankroll")
+    tc.add_argument("--from-shortlist", type=int, default=None, metavar="N",
+                    help="copy the top N wallets from `polywatch discover` instead of naming "
+                         "them; excluded wallets are never chosen")
+    tc.add_argument("--min-rank-score", type=float, default=None,
+                    help="floor on rank_score when building a roster from the shortlist")
+    tc.add_argument("--per-trader-usd", type=float, default=None,
+                    help="cap on what one trader's signals may have at risk; defaults to an "
+                         "equal share of the bankroll")
+    tc.add_argument("--auto-drop-usd", type=float, default=None,
+                    help="stop copying a trader after their signals lose this much in a run")
     tc.add_argument("--preset", default="quick_flips", choices=sorted(task_mod.PRESETS),
                     help="quick_flips is what the poller is tuned for; hours loosens the "
                          "exits for an idea you intend to babysit yourself")
