@@ -228,6 +228,23 @@ def condition_ids_in_trades(con: sqlite3.Connection, selected_only: bool = False
     return {r[0] for r in con.execute(sql)}
 
 
+def condition_ids_for_wallets(con: sqlite3.Connection, wallets: Sequence[str]) -> set[str]:
+    """Condition ids traded by specific wallets.
+
+    The narrow counterpart to `condition_ids_in_trades(selected_only=True)`. Walk-forward
+    validation only needs market metadata for the one candidate being validated, and the wide
+    version would pull every market touched by every screened wallet -- measured on a real
+    sweep, 122,277 unfetched markets and roughly twelve thousand requests, to backtest one
+    wallet that traded a few hundred of them.
+    """
+    if not wallets:
+        return set()
+    marks = ",".join("?" * len(wallets))
+    return {r[0] for r in con.execute(
+        f"SELECT DISTINCT condition_id FROM trades WHERE wallet IN ({marks})",
+        [w.lower() for w in wallets])}
+
+
 def trade_times_by_token(con: sqlite3.Connection, selected_only: bool = False
                          ) -> dict[str, list[int]]:
     if selected_only:
@@ -304,19 +321,23 @@ def delete_task(con: sqlite3.Connection, name: str) -> int:
     return n
 
 
-def start_run(con: sqlite3.Connection, task: str, mode: str, bankroll: float) -> int:
+def start_run(con: sqlite3.Connection, task: str, mode: str, bankroll: float,
+              started_at: int | None = None) -> int:
+    """`started_at` is explicit so a historical replay can stamp a run in the past. A backtest
+    whose run rows all claim to have started today is unsortable against a live one."""
     cur = con.execute(
         "INSERT INTO task_runs (task, mode, started_at, start_bankroll) VALUES (?,?,?,?)",
-        (task, mode, int(time.time()), bankroll),
+        (task, mode, int(time.time()) if started_at is None else started_at, bankroll),
     )
     con.commit()
     return int(cur.lastrowid)
 
 
-def finish_run(con: sqlite3.Connection, run_id: int, end_bankroll: float, reason: str) -> None:
+def finish_run(con: sqlite3.Connection, run_id: int, end_bankroll: float, reason: str,
+               stopped_at: int | None = None) -> None:
     con.execute(
         "UPDATE task_runs SET stopped_at=?, end_bankroll=?, stop_reason=? WHERE id=?",
-        (int(time.time()), end_bankroll, reason, run_id),
+        (int(time.time()) if stopped_at is None else stopped_at, end_bankroll, reason, run_id),
     )
     con.commit()
 
@@ -441,12 +462,17 @@ def add_to_position(con: sqlite3.Connection, position_id: int, shares: float, co
 
 
 def close_position(con: sqlite3.Connection, position_id: int, proceeds_usd: float,
-                   exit_fee: float, reason: str) -> float:
+                   exit_fee: float, reason: str, closed_ts: int | None = None) -> float:
     """Settle a position and return its realized PnL.
 
     PnL is proceeds minus entry cost minus every fee on both sides. Fees are subtracted here
     rather than folded into cost_usd so that `report` can show what the taker fee actually
     cost over a run -- the number this whole exercise exists to measure.
+
+    `closed_ts` defaults to now for a live run, but a replay must pass the historical settlement
+    time. Without it every backtested position would appear to have closed the moment the
+    backtest ran, and holding periods -- the thing a copy trader most needs to see -- would all
+    read as zero.
     """
     row = con.execute("SELECT cost_usd, fees_paid FROM positions WHERE id=?",
                       (position_id,)).fetchone()
@@ -457,7 +483,8 @@ def close_position(con: sqlite3.Connection, position_id: int, proceeds_usd: floa
         """UPDATE positions
            SET open=0, closed_ts=?, close_reason=?, realized_pnl=?, fees_paid=fees_paid+?
            WHERE id=?""",
-        (int(time.time()), reason, pnl, exit_fee, position_id),
+        (int(time.time()) if closed_ts is None else closed_ts, reason, pnl, exit_fee,
+         position_id),
     )
     con.commit()
     return pnl
