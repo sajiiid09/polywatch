@@ -32,8 +32,14 @@ from . import book as bk
 
 @dataclass
 class Fill:
-    """What an order actually did. `status` is what the engine branches on."""
-    status: str                 # 'filled' | 'partial' | 'rejected'
+    """What an order actually did. `status` is what the engine branches on.
+
+    'unknown' is the important one and it is not a synonym for 'rejected'. It means the exchange
+    accepted the order and its response did not say what happened -- the shares may exist. The
+    engine must not book a position from a guess, and must not assume nothing happened either;
+    it records the order and hands the question to reconciliation.
+    """
+    status: str                 # 'filled' | 'partial' | 'rejected' | 'unknown'
     shares: float = 0.0
     cost: float = 0.0           # USDC out on a buy, in on a sell, excluding fee
     avg_price: float = 0.0
@@ -46,6 +52,10 @@ class Fill:
     @property
     def ok(self) -> bool:
         return self.shares > 0
+
+    @property
+    def unknown(self) -> bool:
+        return self.status == "unknown"
 
 
 @dataclass
@@ -81,6 +91,19 @@ class Executor:
     def resting_fill(self, order: dict, book: dict, *, fee_rate: float) -> Fill | None:
         """Has a resting order filled? Returns a Fill when it has, None while it still rests."""
         raise NotImplementedError
+
+    def order_status(self, exchange_id: str) -> dict | None:
+        """The exchange's own view of one order, for reconciliation. None when it cannot say."""
+        return None
+
+    def account_positions(self) -> dict[str, float] | None:
+        """{token_id: shares} the exchange believes this account holds.
+
+        None means "cannot be determined", which is different from an empty dict. Reconciliation
+        treats the two very differently: an empty account is a fact, an unanswerable one is a
+        reason to stop.
+        """
+        return None
 
 
 class PaperExecutor(Executor):
@@ -132,19 +155,27 @@ class PaperExecutor(Executor):
         return True
 
     def resting_fill(self, order: dict, book: dict, *, fee_rate: float) -> Fill | None:
-        """A resting sell fills when someone bids up to it.
+        """A resting sell fills when bids arrive at or above it, and only for as much as they buy.
 
-        Modelled as: the best bid reached our price, so our order -- which was on the book
-        before that bid arrived -- was hit. This ignores queue position, which is the same
-        optimism the taker path carries and in the same direction.
+        Modelled as: every bid resting at or above our price would have crossed with us, so our
+        order -- which was there first -- was hit for that much and no more. Filling the whole
+        order off a one-share bid is not optimism about queue position, it is an invention of
+        liquidity, and it would flatter exactly the exit that carries most of a run's PnL.
+
+        We are the maker here, so the fill is at our own price rather than at the taker's.
+        Queue position is still ignored, which is the same optimism the taker path carries and
+        in the same direction.
         """
-        best = bk.best_bid(book)
-        if best is None or best < order["price"] - 1e-9:
-            return None
-        shares = order["shares"]
         price = order["price"]
-        f = bk.fee(shares, price, fee_rate)
-        return Fill("filled", shares, shares * price, price, f, price, price)
+        levels = [(p, sz) for p, sz in (book.get("bids") or []) if p >= price - 1e-9]
+        if not levels:
+            return None
+        w = bk._walk(levels, shares=order["shares"])
+        if not w.filled:
+            return None
+        f = bk.fee(w.shares, price, fee_rate)
+        return Fill("filled" if not w.exhausted else "partial", w.shares, w.shares * price,
+                    price, f, price, price)
 
 
 class LiveExecutor(Executor):
@@ -204,22 +235,38 @@ class LiveExecutor(Executor):
         signed = self.client.create_order(args)
         return self.client.post_order(signed, getattr(OrderType, order_type))
 
-    @staticmethod
-    def _filled(resp: dict) -> tuple[float, float]:
-        """(shares, usdc) actually matched, from whichever field the server used.
+    # Every field name the CLOB has been observed to report a matched amount under, paired with
+    # the notional field that accompanies it. The list is additive: a new server version adds a
+    # pair here rather than changing how an unreadable response is treated.
+    MATCH_FIELDS = (("sizeMatched", "makingAmount"), ("size_matched", "amount"),
+                    ("sizeMatched", "takingAmount"), ("matched_size", "matched_amount"),
+                    ("filledSize", "filledAmount"))
 
-        The CLOB reports matched amounts inconsistently between order types and versions, so
-        this reads the fields that exist and returns zeros rather than guessing. A zero here
-        means "the response did not say", which the caller reports as a partial rather than
-        booking a fill that may not have happened.
+    @classmethod
+    def _filled(cls, resp: dict) -> tuple[float, float] | None:
+        """(shares, usdc) actually matched -- or None when the response does not say.
+
+        The distinction between "matched nothing" and "did not say" is the whole point of this
+        function, and getting it wrong is the one failure this program cannot reconcile
+        afterwards. A response carrying `sizeMatched: 0` is a fact: the FAK order was killed and
+        no shares exist. A response carrying no field we recognise is not a fact about the
+        order, it is a fact about our parser -- the shares may well be sitting in the account.
+
+        Returning zeros for both cases, as this used to, books a real fill as a rejection and
+        leaves shares on the exchange that the database has no row for. So: zeros only when the
+        server said zero, None otherwise, and the caller turns None into `unknown` rather than
+        `rejected`.
         """
-        for shares_key, usd_key in (("sizeMatched", "makingAmount"), ("size_matched", "amount")):
-            if shares_key in resp:
-                try:
-                    return float(resp.get(shares_key) or 0), float(resp.get(usd_key) or 0)
-                except (TypeError, ValueError):
-                    return 0.0, 0.0
-        return 0.0, 0.0
+        if not isinstance(resp, dict):
+            return None
+        for shares_key, usd_key in cls.MATCH_FIELDS:
+            if shares_key not in resp:
+                continue
+            try:
+                return float(resp.get(shares_key) or 0), float(resp.get(usd_key) or 0)
+            except (TypeError, ValueError):
+                return None
+        return None
 
     # --- interface ----------------------------------------------------------------------
 
@@ -240,7 +287,12 @@ class LiveExecutor(Executor):
         if not resp.get("success", True):
             return Fill("rejected", limit_price=limit, book_vwap=w.vwap,
                         reason=str(resp.get("errorMsg") or resp)[:200])
-        got, spent = self._filled(resp)
+        matched = self._filled(resp)
+        if matched is None:
+            return Fill("unknown", limit_price=limit, book_vwap=w.vwap,
+                        exchange_id=resp.get("orderID"),
+                        reason="accepted, but the response did not say what matched")
+        got, spent = matched
         if got <= 0:
             return Fill("rejected", limit_price=limit, book_vwap=w.vwap,
                         exchange_id=resp.get("orderID"),
@@ -261,7 +313,12 @@ class LiveExecutor(Executor):
         if not resp.get("success", True):
             return Fill("rejected", limit_price=limit, book_vwap=w.vwap,
                         reason=str(resp.get("errorMsg") or resp)[:200])
-        got, got_usd = self._filled(resp)
+        matched = self._filled(resp)
+        if matched is None:
+            return Fill("unknown", limit_price=limit, book_vwap=w.vwap,
+                        exchange_id=resp.get("orderID"),
+                        reason="accepted, but the response did not say what matched")
+        got, got_usd = matched
         if got <= 0:
             return Fill("rejected", limit_price=limit, book_vwap=w.vwap,
                         exchange_id=resp.get("orderID"), reason="accepted but nothing matched")
@@ -288,6 +345,37 @@ class LiveExecutor(Executor):
         except Exception:  # noqa: BLE001
             return False
         return bool(resp)
+
+    def order_status(self, exchange_id: str) -> dict | None:
+        """The exchange's own view of one order. None when it cannot be reached or does not know."""
+        if not exchange_id:
+            return None
+        try:
+            return self.client.get_order(exchange_id)
+        except Exception:  # noqa: BLE001 - reconciliation treats "cannot say" as its own answer
+            return None
+
+    def account_positions(self) -> dict[str, float] | None:
+        """{token_id: shares} the exchange believes the funder account holds.
+
+        Read from data-api rather than from the CLOB because /positions is the same view the
+        Polymarket UI shows, which is the view an operator will check this against.
+        """
+        from ..fetch import polymarket as api
+        from ..fetch.client import Client, FetchError
+        funder = os.environ.get(ENV_FUNDER)
+        if not funder:
+            return None
+        try:
+            payload = api.positions(Client(con=None, dump_raw=False, log_ok=False), funder)
+        except FetchError:
+            return None
+        out: dict[str, float] = {}
+        for rec in payload or []:
+            token = rec.get("asset")
+            if token:
+                out[str(token)] = out.get(str(token), 0.0) + float(rec.get("size") or 0.0)
+        return out
 
     def resting_fill(self, order: dict, book: dict, *, fee_rate: float) -> Fill | None:
         """Ask the exchange, not the book -- live, the order either matched or it did not."""

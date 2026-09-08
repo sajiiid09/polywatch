@@ -43,9 +43,45 @@ def init_db(con: sqlite3.Connection) -> None:
     # table that already exists, so these have to be spelled out.
     have = {r["name"] for r in con.execute("PRAGMA table_info(markets)")}
     for col, decl in (("gamma_id", "TEXT"), ("tick_size", "REAL"), ("order_min_size", "REAL"),
-                      ("accepting_orders", "INTEGER"), ("enable_order_book", "INTEGER")):
+                      ("accepting_orders", "INTEGER"), ("enable_order_book", "INTEGER"),
+                      ("neg_risk_id", "TEXT")):
         if col not in have:
             con.execute(f"ALTER TABLE markets ADD COLUMN {col} {decl}")
+    # ...and for databases written before a partially-sold position had anywhere to put the fees
+    # it had already expensed. Defaulting to 0 is right for old rows: nothing before this column
+    # existed could record a partial exit in the first place.
+    have = {r["name"] for r in con.execute("PRAGMA table_info(positions)")}
+    for col, decl in (("fees_realized", "REAL NOT NULL DEFAULT 0"),):
+        if col not in have:
+            con.execute(f"ALTER TABLE positions ADD COLUMN {col} {decl}")
+    # ...and before an order kept a thread back to the exchange, which is what reconciliation
+    # pulls on when a response did not say what the order matched.
+    have = {r["name"] for r in con.execute("PRAGMA table_info(orders)")}
+    for col, decl in (("exchange_id", "TEXT"),):
+        if col not in have:
+            con.execute(f"ALTER TABLE orders ADD COLUMN {col} {decl}")
+    # ...and before a signal recorded when its page arrived, which is what separates the feed's
+    # lag from the loop's. Old rows keep NULL and the report falls back to the combined figure.
+    have = {r["name"] for r in con.execute("PRAGMA table_info(signals)")}
+    for col, decl in (("fetch_ts", "INTEGER"),):
+        if col not in have:
+            con.execute(f"ALTER TABLE signals ADD COLUMN {col} {decl}")
+    have = {r["name"] for r in con.execute("PRAGMA table_info(market_meta)")}
+    for col, decl in (("neg_risk_id", "TEXT"),):
+        if col not in have:
+            con.execute(f"ALTER TABLE market_meta ADD COLUMN {col} {decl}")
+    # ...and before a score card could say whether the wallet's edge survives being copied.
+    # ...and before a run could copy more than one wallet at a time.
+    for table in ("positions", "orders"):
+        have = {r["name"] for r in con.execute(f"PRAGMA table_info({table})")}
+        if "trader" not in have:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN trader TEXT")
+    have = {r["name"] for r in con.execute("PRAGMA table_info(trader_scores)")}
+    for col, decl in (("capture_ratio", "REAL"), ("edge_half_life_s", "REAL"),
+                      ("hold_p50_s", "INTEGER"), ("fee_adjusted_roi", "REAL"),
+                      ("recent_roi", "REAL"), ("luck_p", "REAL"), ("excluded", "TEXT")):
+        if col not in have:
+            con.execute(f"ALTER TABLE trader_scores ADD COLUMN {col} {decl}")
     con.commit()
 
 
@@ -321,10 +357,82 @@ def delete_task(con: sqlite3.Connection, name: str) -> int:
     return n
 
 
-def start_run(con: sqlite3.Connection, task: str, mode: str, bankroll: float,
-              started_at: int | None = None) -> int:
-    """`started_at` is explicit so a historical replay can stamp a run in the past. A backtest
-    whose run rows all claim to have started today is unsortable against a live one."""
+# --- the traders a task copies --------------------------------------------
+
+
+def set_task_traders(con: sqlite3.Connection, task: str, rows: list[dict]) -> int:
+    """Replace a task's roster. Editing a task's traders is a deliberate act, not a merge."""
+    now = int(time.time())
+    con.execute("DELETE FROM task_traders WHERE task=?", (task,))
+    con.executemany(
+        """INSERT INTO task_traders (task, address, weight, rank_score, active, added_ts)
+           VALUES (?,?,?,?,1,?)""",
+        [(task, r["address"].lower(), r.get("weight", 1.0), r.get("rank_score"), now)
+         for r in rows])
+    con.commit()
+    return len(rows)
+
+
+def task_traders(con: sqlite3.Connection, task: str, active_only: bool = False
+                 ) -> list[sqlite3.Row]:
+    sql = "SELECT * FROM task_traders WHERE task=?"
+    if active_only:
+        sql += " AND active=1"
+    return con.execute(sql + " ORDER BY weight DESC, address", (task,)).fetchall()
+
+
+def drop_task_trader(con: sqlite3.Connection, task: str, address: str, reason: str) -> None:
+    """Stop copying one wallet. Their open positions are still managed to the end of the run --
+    dropping a trader is a decision to stop taking their advice, not to abandon their trades."""
+    con.execute(
+        "UPDATE task_traders SET active=0, dropped_reason=? WHERE task=? AND address=?",
+        (reason, task, address.lower()))
+    con.commit()
+
+
+def trader_pnl(con: sqlite3.Connection, run_id: int) -> dict[str, dict]:
+    """Per-trader attribution for one run: what each wallet's signals actually earned.
+
+    The point of copying several traders is being able to tell them apart afterwards. Without
+    this a portfolio run reports one number and the bad wallet hides inside it.
+    """
+    out: dict[str, dict] = {}
+    for r in con.execute(
+        """SELECT COALESCE(trader,'?') t, COUNT(*) n,
+                  COALESCE(SUM(realized_pnl),0) pnl,
+                  COALESCE(SUM(fees_paid),0) + COALESCE(SUM(fees_realized),0) fees,
+                  SUM(CASE WHEN open=1 THEN 1 ELSE 0 END) still_open,
+                  COALESCE(SUM(CASE WHEN open=1 THEN cost_usd + fees_paid ELSE 0 END),0) tied
+           FROM positions WHERE run_id=? GROUP BY COALESCE(trader,'?')""", (run_id,)):
+        out[r[0]] = {"positions": int(r[1]), "realized_pnl": float(r[2]),
+                     "fees": float(r[3]), "open": int(r[4]), "exposure": float(r[5]),
+                     "signals": 0, "copied": 0}
+    for r in con.execute(
+        """SELECT trader, COUNT(*), SUM(CASE WHEN action='copied' THEN 1 ELSE 0 END)
+           FROM signals WHERE run_id=? GROUP BY trader""", (run_id,)):
+        row = out.setdefault(r[0], {"positions": 0, "realized_pnl": 0.0, "fees": 0.0,
+                                    "open": 0, "exposure": 0.0, "signals": 0, "copied": 0})
+        row["signals"] = int(r[1])
+        row["copied"] = int(r[2] or 0)
+    return out
+
+
+def trader_exposure(con: sqlite3.Connection, run_id: int, trader: str) -> float:
+    """Open cost across every position one trader's signals opened."""
+    row = con.execute(
+        """SELECT COALESCE(SUM(cost_usd + fees_paid), 0) FROM positions
+           WHERE run_id=? AND trader=? AND open=1""", (run_id, trader.lower())).fetchone()
+    return float(row[0])
+
+
+def trader_realized(con: sqlite3.Connection, run_id: int, trader: str) -> float:
+    row = con.execute(
+        "SELECT COALESCE(SUM(realized_pnl), 0) FROM positions WHERE run_id=? AND trader=?",
+        (run_id, trader.lower())).fetchone()
+    return float(row[0])
+
+
+def start_run(con: sqlite3.Connection, task: str, mode: str, bankroll: float) -> int:
     cur = con.execute(
         "INSERT INTO task_runs (task, mode, started_at, start_bankroll) VALUES (?,?,?,?)",
         (task, mode, int(time.time()) if started_at is None else started_at, bankroll),
@@ -369,25 +477,17 @@ def insert_signal(con: sqlite3.Connection, row: dict) -> int | None:
     stale trade would be most expensive.
     """
     row.setdefault("seen_ts", int(time.time()))
+    row.setdefault("fetch_ts", row["seen_ts"])
     cur = con.execute(
         """INSERT OR IGNORE INTO signals
                (run_id, trader, kind, tx_hash, token_id, condition_id, side, size, price,
-                usdc_size, trader_ts, seen_ts, action, reason)
+                usdc_size, trader_ts, fetch_ts, seen_ts, action, reason)
            VALUES (:run_id,:trader,:kind,:tx_hash,:token_id,:condition_id,:side,:size,:price,
-                :usdc_size,:trader_ts,:seen_ts,:action,:reason)""",
+                :usdc_size,:trader_ts,:fetch_ts,:seen_ts,:action,:reason)""",
         row,
     )
     con.commit()
     return int(cur.lastrowid) if cur.rowcount else None
-
-
-def signal_seen(con: sqlite3.Connection, run_id: int, tx_hash: str, token_id: str,
-                side: str | None, size: float | None) -> bool:
-    return con.execute(
-        """SELECT 1 FROM signals
-           WHERE run_id=? AND tx_hash=? AND token_id=? AND side IS ? AND size IS ?""",
-        (run_id, tx_hash, token_id, side, size),
-    ).fetchone() is not None
 
 
 def signals(con: sqlite3.Connection, run_id: int, action: str | None = None
@@ -398,6 +498,28 @@ def signals(con: sqlite3.Connection, run_id: int, action: str | None = None
         sql += " AND action=?"
         args += (action,)
     return con.execute(sql + " ORDER BY seen_ts, id", args).fetchall()
+
+
+def trader_observed_shares(con: sqlite3.Connection, run_id: int, trader: str, token_id: str,
+                           before_ts: int | None = None) -> float:
+    """Shares of one token the target has accumulated *as far as this run has watched them*.
+
+    Buys minus sells across every signal recorded for them, copied or skipped -- which is why
+    skipped signals are recorded at all. It is a floor, not their position: anything they were
+    holding before the run started is invisible to it.
+
+    That floor is the safe direction. Used to size a proportional follow-exit, underestimating
+    what they hold overestimates the fraction they just sold, so we exit at least as much as they
+    did. The failure mode is the old behaviour -- selling everything -- not selling too little.
+    """
+    sql = """SELECT COALESCE(SUM(CASE WHEN side='BUY' THEN size ELSE -size END), 0)
+             FROM signals WHERE run_id=? AND trader=? AND token_id=? AND kind='TRADE'
+                          AND side IS NOT NULL"""
+    args: tuple = (run_id, trader, token_id)
+    if before_ts is not None:
+        sql += " AND trader_ts < ?"
+        args += (before_ts,)
+    return float(con.execute(sql, args).fetchone()[0])
 
 
 def skip_reasons(con: sqlite3.Connection, run_id: int) -> list[tuple[str, int]]:
@@ -411,12 +533,16 @@ def skip_reasons(con: sqlite3.Connection, run_id: int) -> list[tuple[str, int]]:
 
 def insert_order(con: sqlite3.Connection, row: dict) -> int:
     row.setdefault("ts", int(time.time()))
+    row.setdefault("exchange_id", None)
+    row.setdefault("trader", None)
     cur = con.execute(
         """INSERT INTO orders
-               (run_id, signal_id, mode, token_id, condition_id, side, intent_usd, limit_price,
-                book_vwap, filled_shares, avg_price, fee, status, reason, ts)
-           VALUES (:run_id,:signal_id,:mode,:token_id,:condition_id,:side,:intent_usd,
-                :limit_price,:book_vwap,:filled_shares,:avg_price,:fee,:status,:reason,:ts)""",
+               (run_id, signal_id, trader, mode, token_id, condition_id, side, intent_usd,
+                limit_price, book_vwap, filled_shares, avg_price, fee, status, exchange_id,
+                reason, ts)
+           VALUES (:run_id,:signal_id,:trader,:mode,:token_id,:condition_id,:side,:intent_usd,
+                :limit_price,:book_vwap,:filled_shares,:avg_price,:fee,:status,:exchange_id,
+                :reason,:ts)""",
         row,
     )
     con.commit()
@@ -428,14 +554,44 @@ def orders(con: sqlite3.Connection, run_id: int) -> list[sqlite3.Row]:
                        (run_id,)).fetchall()
 
 
+def unknown_orders(con: sqlite3.Connection, run_id: int) -> list[sqlite3.Row]:
+    """Orders the exchange accepted without saying what they matched.
+
+    Each one of these is a question the database cannot answer on its own, and every one of them
+    must be closed out by reconciliation before the run is allowed to keep trading.
+    """
+    return con.execute(
+        "SELECT * FROM orders WHERE run_id=? AND status='unknown' ORDER BY ts, id",
+        (run_id,)).fetchall()
+
+
+def resolve_order(con: sqlite3.Connection, order_id: int, status: str, shares: float,
+                  avg_price: float | None, fee: float, reason: str) -> None:
+    """Write back what an order turned out to have done, once the exchange has been asked."""
+    con.execute(
+        """UPDATE orders SET status=?, filled_shares=?, avg_price=?, fee=?, reason=?
+           WHERE id=?""",
+        (status, shares, avg_price, fee, reason, order_id))
+    con.commit()
+
+
+def recorded_shares(con: sqlite3.Connection, run_id: int, token_id: str) -> float:
+    """Shares of one token this run believes it is holding."""
+    row = con.execute(
+        """SELECT COALESCE(SUM(shares), 0) FROM positions
+           WHERE run_id=? AND token_id=? AND open=1""", (run_id, token_id)).fetchone()
+    return float(row[0])
+
+
 def open_position(con: sqlite3.Connection, row: dict) -> int:
     row.setdefault("opened_ts", int(time.time()))
+    row.setdefault("trader", None)
     cur = con.execute(
         """INSERT INTO positions
-               (run_id, token_id, condition_id, shares, avg_price, cost_usd, fees_paid,
+               (run_id, trader, token_id, condition_id, shares, avg_price, cost_usd, fees_paid,
                 opened_ts, open)
-           VALUES (:run_id,:token_id,:condition_id,:shares,:avg_price,:cost_usd,:fees_paid,
-                :opened_ts,1)""",
+           VALUES (:run_id,:trader,:token_id,:condition_id,:shares,:avg_price,:cost_usd,
+                :fees_paid,:opened_ts,1)""",
         row,
     )
     con.commit()
@@ -461,32 +617,66 @@ def add_to_position(con: sqlite3.Connection, position_id: int, shares: float, co
     con.commit()
 
 
-def close_position(con: sqlite3.Connection, position_id: int, proceeds_usd: float,
-                   exit_fee: float, reason: str, closed_ts: int | None = None) -> float:
-    """Settle a position and return its realized PnL.
+def settle_position(con: sqlite3.Connection, position_id: int, shares_sold: float,
+                    proceeds_usd: float, exit_fee: float, reason: str) -> tuple[float, bool]:
+    """Realize all or part of a position. Returns (pnl of the sold portion, position closed).
 
-    PnL is proceeds minus entry cost minus every fee on both sides. Fees are subtracted here
-    rather than folded into cost_usd so that `report` can show what the taker fee actually
-    cost over a run -- the number this whole exercise exists to measure.
+    Two columns carry fees, and the split is the whole point of this function:
 
-    `closed_ts` defaults to now for a live run, but a replay must pass the historical settlement
-    time. Without it every backtested position would appear to have closed the moment the
-    backtest ran, and holding periods -- the thing a copy trader most needs to see -- would all
-    read as zero.
+      * `fees_paid` is the entry fee attributable to the shares *still held*. It is what
+        `exits.mark` adds to `cost_usd` to get the cost basis a stop-loss is measured against,
+        and what `run_cash` treats as tied up.
+      * `fees_realized` is everything already expensed against realized PnL -- entry fees on
+        shares that have been sold, plus every exit fee.
+
+    Scaling `fees_paid` down by the sold fraction is not cosmetic. Leaving the whole entry fee on
+    a remainder makes that remainder's cost basis larger than it ever was, so the stop-loss fires
+    against a loss that is partly fictional and `run_cash` reports less money than the run has.
+
+    A partial sale leaves the position open with the remainder, its PnL banked, and the ladder
+    free to try again on the next tick.
     """
-    row = con.execute("SELECT cost_usd, fees_paid FROM positions WHERE id=?",
-                      (position_id,)).fetchone()
+    row = con.execute(
+        "SELECT shares, cost_usd, fees_paid, realized_pnl FROM positions WHERE id=?",
+        (position_id,)).fetchone()
     if row is None:
         raise KeyError(f"no position {position_id}")
-    pnl = proceeds_usd - row["cost_usd"] - row["fees_paid"] - exit_fee
-    con.execute(
-        """UPDATE positions
-           SET open=0, closed_ts=?, close_reason=?, realized_pnl=?, fees_paid=fees_paid+?
-           WHERE id=?""",
-        (int(time.time()) if closed_ts is None else closed_ts, reason, pnl, exit_fee,
-         position_id),
-    )
+    held = row["shares"]
+    if held <= 0:
+        raise ValueError(f"position {position_id} holds no shares")
+
+    closed = shares_sold >= held - 1e-6
+    frac = 1.0 if closed else shares_sold / held
+    part_cost = row["cost_usd"] * frac
+    part_fees = row["fees_paid"] * frac
+    pnl = proceeds_usd - part_cost - part_fees - exit_fee
+    banked = (row["realized_pnl"] or 0.0) + pnl
+
+    if closed:
+        con.execute(
+            """UPDATE positions
+               SET open=0, closed_ts=?, close_reason=?, realized_pnl=?,
+                   cost_usd=0, fees_paid=0, fees_realized=fees_realized+?
+               WHERE id=?""",
+            (int(time.time()), reason, banked, part_fees + exit_fee, position_id))
+    else:
+        con.execute(
+            """UPDATE positions
+               SET shares=shares-?, cost_usd=cost_usd-?, fees_paid=fees_paid-?,
+                   fees_realized=fees_realized+?, realized_pnl=?
+               WHERE id=?""",
+            (shares_sold, part_cost, part_fees, part_fees + exit_fee, banked, position_id))
     con.commit()
+    return pnl, closed
+
+
+def close_position(con: sqlite3.Connection, position_id: int, proceeds_usd: float,
+                   exit_fee: float, reason: str) -> float:
+    """Settle a whole position and return its realized PnL. Thin wrapper over settle_position."""
+    row = con.execute("SELECT shares FROM positions WHERE id=?", (position_id,)).fetchone()
+    if row is None:
+        raise KeyError(f"no position {position_id}")
+    pnl, _ = settle_position(con, position_id, row["shares"], proceeds_usd, exit_fee, reason)
     return pnl
 
 
@@ -500,6 +690,19 @@ def open_position_for(con: sqlite3.Connection, run_id: int, token_id: str) -> sq
     return con.execute(
         "SELECT * FROM positions WHERE run_id=? AND token_id=? AND open=1", (run_id, token_id)
     ).fetchone()
+
+
+def open_position_other_outcome(con: sqlite3.Connection, run_id: int, condition_id: str,
+                                token_id: str) -> sqlite3.Row | None:
+    """An open position on a DIFFERENT outcome of the same market.
+
+    Holding YES and NO of one market pays two entry fees and two exit fees to end up with
+    approximately no exposure, so this is the query behind a gate rather than a report.
+    """
+    return con.execute(
+        """SELECT * FROM positions
+           WHERE run_id=? AND condition_id=? AND token_id<>? AND open=1 LIMIT 1""",
+        (run_id, condition_id, token_id)).fetchone()
 
 
 def market_exposure(con: sqlite3.Connection, run_id: int, condition_id: str) -> float:
@@ -516,6 +719,21 @@ def market_exposure(con: sqlite3.Connection, run_id: int, condition_id: str) -> 
     return float(row[0])
 
 
+def event_exposure(con: sqlite3.Connection, run_id: int, neg_risk_id: str) -> float:
+    """Open cost across every market belonging to one neg-risk event.
+
+    The outcomes of a neg-risk event are mutually exclusive slices of a single question. Holding
+    three of them is one view expressed three times, and a cap applied per market would let it
+    through three times over.
+    """
+    row = con.execute(
+        """SELECT COALESCE(SUM(p.cost_usd + p.fees_paid), 0) FROM positions p
+           JOIN market_meta m ON m.condition_id = p.condition_id
+           WHERE p.run_id=? AND p.open=1 AND m.neg_risk_id=?""",
+        (run_id, neg_risk_id)).fetchone()
+    return float(row[0])
+
+
 def run_cash(con: sqlite3.Connection, run_id: int) -> float:
     """Uninvested cash: the starting bankroll, minus what open positions tie up, plus what
     closed ones returned."""
@@ -529,9 +747,12 @@ def run_cash(con: sqlite3.Connection, run_id: int) -> float:
     # Only the PnL, not cost + PnL. `tied` counts open positions only, so a closed position's
     # cost was never subtracted here to begin with -- adding it back would credit the account
     # with money it never spent.
+    #
+    # Summed over every position, not just closed ones: a position that has been partially sold
+    # is still open and has already banked the PnL of the part that went.
     realized = con.execute(
         """SELECT COALESCE(SUM(realized_pnl), 0) FROM positions
-           WHERE run_id=? AND open=0""", (run_id,)).fetchone()[0]
+           WHERE run_id=?""", (run_id,)).fetchone()[0]
     return float(start[0]) - float(tied) + float(realized)
 
 
@@ -544,9 +765,12 @@ def run_summary(con: sqlite3.Connection, run_id: int) -> dict:
         "orders": q("SELECT COUNT(*) FROM orders WHERE run_id=?"),
         "positions_open": q("SELECT COUNT(*) FROM positions WHERE run_id=? AND open=1"),
         "positions_closed": q("SELECT COUNT(*) FROM positions WHERE run_id=? AND open=0"),
-        "fees_paid": q("SELECT COALESCE(SUM(fees_paid),0) FROM positions WHERE run_id=?"),
+        # Both columns: `fees_paid` is what open shares still carry, `fees_realized` is what
+        # has already been expensed. Their sum is what the run has actually paid the exchange.
+        "fees_paid": q("""SELECT COALESCE(SUM(fees_paid),0) + COALESCE(SUM(fees_realized),0)
+                          FROM positions WHERE run_id=?"""),
         "realized_pnl": q(
-            "SELECT COALESCE(SUM(realized_pnl),0) FROM positions WHERE run_id=? AND open=0"),
+            "SELECT COALESCE(SUM(realized_pnl),0) FROM positions WHERE run_id=?"),
         "cash": run_cash(con, run_id),
     }
 
@@ -554,11 +778,14 @@ def run_summary(con: sqlite3.Connection, run_id: int) -> dict:
 TRADER_SCORE_COLUMNS = ("address", "scanned_at", "n_closed", "win_rate", "roi", "realized_pnl",
                         "brier", "avg_entry_price", "avg_stake_usd", "max_drawdown",
                         "consistency", "est_account_usd", "top_category", "persona_fit",
-                        "rank_score", "metrics_json")
+                        "rank_score", "capture_ratio", "edge_half_life_s", "hold_p50_s",
+                        "fee_adjusted_roi", "recent_roi", "luck_p", "excluded", "metrics_json")
 
 
 def upsert_trader_score(con: sqlite3.Connection, row: dict) -> None:
     row.setdefault("scanned_at", int(time.time()))
+    for c in TRADER_SCORE_COLUMNS:
+        row.setdefault(c, None)
     cols = ",".join(TRADER_SCORE_COLUMNS)
     binds = ",".join(f":{c}" for c in TRADER_SCORE_COLUMNS)
     sets = ",".join(f"{c}=excluded.{c}" for c in TRADER_SCORE_COLUMNS if c != "address")
@@ -572,20 +799,69 @@ def get_trader_score(con: sqlite3.Connection, address: str) -> sqlite3.Row | Non
                        (address.lower(),)).fetchone()
 
 
-def top_trader_scores(con: sqlite3.Connection, limit: int = 30) -> list[sqlite3.Row]:
-    return con.execute(
-        "SELECT * FROM trader_scores WHERE rank_score IS NOT NULL "
-        "ORDER BY rank_score DESC LIMIT ?", (limit,)
-    ).fetchall()
+def top_trader_scores(con: sqlite3.Connection, limit: int = 30,
+                      include_excluded: bool = False) -> list[sqlite3.Row]:
+    """The shortlist, best first. Excluded wallets are held back unless asked for.
+
+    An excluded wallet is not a near-miss to be considered anyway -- it failed a hard gate, such
+    as an edge that does not survive being copied. Seeing them is useful for understanding a
+    sweep; ranking them alongside candidates is not.
+    """
+    sql = "SELECT * FROM trader_scores WHERE rank_score IS NOT NULL"
+    if not include_excluded:
+        sql += " AND excluded IS NULL"
+    return con.execute(sql + " ORDER BY rank_score DESC LIMIT ?", (limit,)).fetchall()
+
+
+def upsert_trader_replay(con: sqlite3.Connection, address: str, rows: list[dict]) -> int:
+    """Replace one wallet's whole decay curve. A rescan overwrites cleanly."""
+    now = int(time.time())
+    con.execute("DELETE FROM trader_replay WHERE address=?", (address.lower(),))
+    con.executemany(
+        """INSERT INTO trader_replay
+               (address, lag_s, n, n_missing, copier_roi, copier_pnl, win_rate, scanned_at)
+           VALUES (?,?,?,?,?,?,?,?)""",
+        [(address.lower(), r["lag_s"], r["n"], r["n_missing"], r["copier_roi"],
+          r["copier_pnl"], r["win_rate"], now) for r in rows])
+    con.commit()
+    return len(rows)
+
+
+def trader_replay(con: sqlite3.Connection, address: str) -> list[sqlite3.Row]:
+    return con.execute("SELECT * FROM trader_replay WHERE address=? ORDER BY lag_s",
+                       (address.lower(),)).fetchall()
+
+
+def trades_for(con: sqlite3.Connection, address: str, since_ts: int | None = None
+               ) -> list[sqlite3.Row]:
+    """One wallet's fills, oldest first -- the raw material for round-trip matching."""
+    sql = "SELECT * FROM trades WHERE wallet=?"
+    args: tuple = (address.lower(),)
+    if since_ts is not None:
+        sql += " AND ts >= ?"
+        args += (since_ts,)
+    return con.execute(sql + " ORDER BY ts", args).fetchall()
+
+
+def fee_rate_by_condition(con: sqlite3.Connection) -> dict[str, tuple[float | None, str | None]]:
+    """{condition_id: (fee_rate, category)} for every market we have ingested.
+
+    One query rather than one per position: replay charges a fee on both legs of every round
+    trip, and looking each rate up individually turns a scoring pass into a few thousand queries.
+    """
+    return {r[0]: (r[1], r[2]) for r in con.execute(
+        "SELECT condition_id, fee_rate, fee_type FROM markets")}
 
 
 MARKET_META_COLUMNS = ("condition_id", "tick_size", "min_order_size", "accepting_orders",
-                       "enable_order_book", "neg_risk", "category_derived", "fee_rate",
-                       "end_ts", "fetched_at")
+                       "enable_order_book", "neg_risk", "neg_risk_id", "category_derived",
+                       "fee_rate", "end_ts", "fetched_at")
 
 
 def upsert_market_meta(con: sqlite3.Connection, row: dict) -> None:
     row.setdefault("fetched_at", int(time.time()))
+    for c in MARKET_META_COLUMNS:
+        row.setdefault(c, None)
     cols = ",".join(MARKET_META_COLUMNS)
     binds = ",".join(f":{c}" for c in MARKET_META_COLUMNS)
     sets = ",".join(f"{c}=excluded.{c}" for c in MARKET_META_COLUMNS if c != "condition_id")
@@ -657,6 +933,24 @@ def orphan_resting(con: sqlite3.Connection, mode: str = "live") -> list[sqlite3.
         """SELECT r.* FROM resting_orders r JOIN task_runs t ON t.id = r.run_id
            WHERE r.status='open' AND r.mode=? AND t.stopped_at IS NOT NULL
            ORDER BY r.placed_ts""", (mode,)).fetchall()
+
+
+def latency_split(con: sqlite3.Connection, run_id: int) -> dict:
+    """Where copy latency actually comes from, averaged over a run.
+
+    `feed` is fetch_ts - trader_ts: how stale the activity endpoint's answer was before we ever
+    saw it, which no amount of polling faster can fix. `loop` is seen_ts - fetch_ts: our own
+    processing, which is the only half worth optimising. Rows written before fetch_ts existed
+    report loop=0 and are honest about it by carrying the whole gap in `feed`.
+    """
+    row = con.execute(
+        """SELECT COUNT(*),
+                  AVG(COALESCE(fetch_ts, seen_ts) - trader_ts),
+                  AVG(seen_ts - COALESCE(fetch_ts, seen_ts))
+           FROM signals WHERE run_id=?""", (run_id,)).fetchone()
+    if not row or not row[0]:
+        return {"n": 0}
+    return {"n": int(row[0]), "feed": float(row[1] or 0.0), "loop": float(row[2] or 0.0)}
 
 
 def latency_samples(con: sqlite3.Connection, run_id: int | None = None) -> list[int]:

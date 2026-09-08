@@ -97,7 +97,7 @@ def test_the_stop_is_measured_after_fees_not_on_the_mid():
 
 def test_take_profit_is_not_checked_when_it_is_resting_on_the_book():
     """It is a live GTC order there; checking it here too would sell the position twice."""
-    t = Task(name="a", trader="0x1", tp_value=0.05, resting_tp=True, sl_kind=None)
+    t = Task(tp_kind="pct", name="a", trader="0x1", tp_value=0.05, resting_tp=True, sl_kind=None)
     b = book_of([(0.60, 1000)], [(0.61, 1000)])
     assert exits.check(t, position(), b, fee_rate=0.0, now=1).exit is False
     t.resting_tp = False
@@ -162,12 +162,29 @@ def test_a_paper_order_below_the_markets_minimum_size_is_refused():
     assert fill.status == "rejected" and "minimum" in fill.reason
 
 
-def test_a_resting_sell_fills_when_the_bid_reaches_it():
+def test_a_resting_sell_does_not_fill_until_the_bid_reaches_it():
     ex = PaperExecutor()
     order = {"price": 0.60, "shares": 100}
     assert ex.resting_fill(order, book_of([(0.59, 10)], []), fee_rate=0.0) is None
+
+
+def test_a_resting_sell_fills_only_for_as_much_as_the_bids_will_buy():
+    """A one-share bid does not lift a hundred-share order. Filling the whole thing off the
+    touch invents liquidity, and it flatters the exit that carries most of a run's PnL."""
+    ex = PaperExecutor()
+    order = {"price": 0.60, "shares": 100}
     fill = ex.resting_fill(order, book_of([(0.60, 10)], []), fee_rate=0.0)
-    assert fill.status == "filled" and fill.cost == pytest.approx(60)
+    assert fill.status == "partial"
+    assert fill.shares == pytest.approx(10) and fill.cost == pytest.approx(6)
+
+
+def test_a_resting_sell_fills_whole_when_there_is_depth_to_fill_it():
+    ex = PaperExecutor()
+    order = {"price": 0.60, "shares": 100}
+    fill = ex.resting_fill(order, book_of([(0.62, 40), (0.60, 200)], []), fee_rate=0.0)
+    assert fill.status == "filled" and fill.shares == pytest.approx(100)
+    # Maker, so we get our own price -- not the better one the taker was willing to pay.
+    assert fill.cost == pytest.approx(60)
 
 
 # --- latency --------------------------------------------------------------
@@ -231,7 +248,7 @@ def engine_for(con, feed, books, task=None, now=1010):
     t = task or Task(name="t", trader="0xtrader", **preset("quick_flips"))
     _task(con, t)
     eng = Engine(con, t, PaperExecutor(), client=None, log=lambda *a: None, now=lambda: now)
-    eng._trader_account = lambda: 10_000.0
+    eng._trader_account = lambda _a: 10_000.0
     eng.start()
     return eng, fake
 
@@ -401,7 +418,7 @@ def test_the_round_trip_fee_is_worst_at_even_odds_and_trivial_at_the_extremes():
 
 def test_a_percentage_target_is_widened_to_clear_the_fees():
     """+8% at 0.56 nets +0.9% and risks the full stop. The target moves; the trade stays."""
-    t = Task(name="a", trader="0x1", tp_value=0.08, min_edge=0.02)
+    t = Task(tp_kind="pct", name="a", trader="0x1", tp_value=0.08, min_edge=0.02)
     assert t.target_is_viable(0.56, 0.05) is False
     widened = t.target_price(0.56, 0.05) / 0.56 - 1
     assert widened == pytest.approx(bk.round_trip_fee_frac(0.56, 0.05) + 0.02)
@@ -416,7 +433,7 @@ def test_an_absolute_target_is_never_moved():
 
 
 def test_the_skip_policy_refuses_the_trade_instead_of_moving_the_target():
-    t = Task(name="a", trader="0x1", tp_value=0.08, tp_fee_policy="skip")
+    t = Task(tp_kind="pct", name="a", trader="0x1", tp_value=0.08, tp_fee_policy="skip")
     base = dict(price=0.56, age_s=5, seconds_to_close=99999, usd=100.0, accepting_orders=True)
     assert exits.entry_gates(t, fee_rate=0.05, **base) == "fee_floor"
     assert exits.entry_gates(t, fee_rate=0.005, **base) is None
@@ -425,7 +442,7 @@ def test_the_skip_policy_refuses_the_trade_instead_of_moving_the_target():
 def test_the_off_policy_leaves_a_target_that_cannot_pay_for_itself():
     """Only sane alongside follow_exit, and it stays available because 'the bot silently
     changed my number' is worse than a number the operator chose."""
-    t = Task(name="a", trader="0x1", tp_value=0.08, tp_fee_policy="off")
+    t = Task(tp_kind="pct", name="a", trader="0x1", tp_value=0.08, tp_fee_policy="off")
     assert t.target_price(0.56, 0.05) == pytest.approx(0.56 * 1.08)
 
 
@@ -444,7 +461,7 @@ def test_the_gate_is_unchanged_when_the_fee_rate_is_unknown():
 
 def test_the_ladder_checks_the_same_widened_target_the_order_was_priced_at(con):
     """Otherwise the watched target and the resting target are two different numbers."""
-    t = Task(name="a", trader="0x1", tp_value=0.08, resting_tp=False, sl_kind=None,
+    t = Task(tp_kind="pct", name="a", trader="0x1", tp_value=0.08, resting_tp=False, sl_kind=None,
              trail_pct=0)
     pos = position(avg_price=0.56, cost_usd=56.0)
     b = book_of([(0.605, 1000)], [(0.61, 1000)])        # +8% but under the widened target
@@ -456,7 +473,7 @@ def test_the_ladder_checks_the_same_widened_target_the_order_was_priced_at(con):
 def test_a_target_the_fees_push_out_of_reach_is_not_posted_at_all(con):
     """Posting it would pin the shares behind an order that never fills."""
     books = {"tok": {"bids": [(0.93, 1000)], "asks": [(0.94, 1000)]}}
-    t = Task(name="t", trader="0xtrader", tp_value=0.10, max_price=0.99, max_fee_frac=0.5)
+    t = Task(tp_kind="pct", name="t", trader="0xtrader", tp_value=0.10, max_price=0.99, max_fee_frac=0.5)
     eng, _ = engine_for(con, [activity_event(price=0.94)], books, task=t)
     eng.poll_signals()
     assert store.open_positions(con, eng.state.run_id)      # the position was still taken
@@ -482,3 +499,77 @@ def test_the_quick_flip_preset_ships_without_a_take_profit(con):
     eng.poll_signals()
     assert store.open_positions(con, eng.state.run_id)
     assert not store.open_resting(con, eng.state.run_id)
+
+
+# --- Phase 1: the loop's half of the correctness work ---------------------
+
+
+def test_the_engine_refuses_to_copy_the_other_outcome_of_a_market_we_hold(con):
+    """Two entry fees and two exit fees to end up flat is not a hedge, it is a donation."""
+    books = {"tok": {"bids": [(0.49, 1000)], "asks": [(0.51, 1000)]},
+             "tok_no": {"bids": [(0.47, 1000)], "asks": [(0.49, 1000)]}}
+    eng, fake = engine_for(con, [activity_event()], books)
+    eng.poll_signals()
+    assert len(store.open_positions(con, eng.state.run_id)) == 1
+
+    fake.feed = [activity_event(asset="tok_no", transactionHash="0xtx2", timestamp=1005)]
+    eng.poll_signals()
+    assert dict(store.skip_reasons(con, eng.state.run_id)) == {"holds_other_outcome": 1}
+    assert len(store.open_positions(con, eng.state.run_id)) == 1
+
+
+def test_a_partial_exit_leaves_the_position_open_with_an_honest_cost_basis(con):
+    """The remainder must not carry the whole entry fee: that is a loss the run never took."""
+    books = {"tok": {"bids": [(0.49, 1000)], "asks": [(0.51, 1000)]}}
+    eng, fake = engine_for(con, [activity_event()], books)
+    eng.poll_signals()
+    before = store.open_positions(con, eng.state.run_id)[0]
+    fee_per_share = before["fees_paid"] / before["shares"]
+
+    # Only a fraction of the position can be sold: the bid side runs out.
+    fake.books["tok"] = {"bids": [(0.30, 4)], "asks": [(0.51, 1000)]}
+    eng.manage_positions()
+
+    after = store.open_positions(con, eng.state.run_id)
+    assert len(after) == 1, "a partial exit must not close the position"
+    assert after[0]["shares"] < before["shares"]
+    assert after[0]["fees_paid"] / after[0]["shares"] == pytest.approx(fee_per_share)
+    assert after[0]["realized_pnl"] < 0, "the sold portion's loss is banked, not deferred"
+
+
+def test_a_live_run_that_cannot_verify_what_it_holds_refuses_to_start(con):
+    """A stop-loss on shares the exchange does not show would sell what we do not have."""
+    from polywatch.copytrade.engine import ReconcileError
+
+    class BlindExchange(PaperExecutor):
+        mode = "live"
+
+        def account_positions(self):
+            return None
+
+    import polywatch.copytrade.engine as engine_mod
+    engine_mod.api = FakeAPI([], {})
+    t = _task(con, Task(name="t", trader="0xtrader"))
+    eng = Engine(con, t, BlindExchange(), client=None, log=lambda *a: None, now=lambda: 1000)
+    eng._trader_account = lambda _a: 0.0
+
+    with pytest.raises(ReconcileError):
+        eng.start()
+    run = store.last_run(con, "t")
+    assert run["stop_reason"] == "reconcile_failed"
+    assert run["stopped_at"] is not None, "a refused run must still be closed out"
+
+
+def test_a_run_that_leaves_positions_open_reports_equity_not_a_phantom_loss(con):
+    """Cash subtracts what a position tied up and adds nothing back for what it is worth."""
+    books = {"tok": {"bids": [(0.49, 1000)], "asks": [(0.51, 1000)]}}
+    t = Task(name="t", trader="0xtrader", flatten_on_stop=False, **preset("quick_flips"))
+    eng, _ = engine_for(con, [activity_event()], books, task=t)
+    eng.poll_signals()
+
+    summary = eng.stop("session_end")
+    assert store.open_positions(con, eng.state.run_id), "nothing was flattened"
+    assert summary["cash"] < summary["equity"]
+    # Equity is the bankroll less only what the round trip actually costs in fees and spread.
+    assert summary["equity"] == pytest.approx(t.bankroll, abs=1.5)
+    assert store.last_run(con, "t")["end_bankroll"] == pytest.approx(summary["equity"])

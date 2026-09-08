@@ -14,8 +14,8 @@ from ..config import ENV_FUNDER, ENV_PRIVATE_KEY, MAX_RPS, POLL_TIMEOUT_S
 from ..db import store
 from ..fetch.client import Client
 from . import book as bk
-from . import execution, report
-from .engine import Engine
+from . import execution, report, stream
+from .engine import Engine, ReconcileError
 from .task import PRESETS, Task, preset
 
 
@@ -28,7 +28,30 @@ def dispatch(args) -> int:
     }[args.task_cmd](con, args)
 
 
-def _build(args) -> Task:
+def _roster(con, args) -> list[str]:
+    """The wallets this task will copy, from --trader, --from-shortlist, or both.
+
+    A roster taken from the shortlist never includes an excluded wallet: exclusion is a
+    statement that the wallet is not a candidate, and quietly copying one because it ranked
+    highly among the rejects would undo the point of ranking.
+    """
+    out = [a.lower() for a in (args.trader or [])]
+    n = getattr(args, "from_shortlist", None)
+    if n:
+        floor = args.min_rank_score or 0.0
+        rows = store.top_trader_scores(con, limit=n * 3)
+        picked = [r["address"] for r in rows if (r["rank_score"] or 0.0) >= floor][:n]
+        if not picked:
+            raise SystemExit(
+                "no wallets in the shortlist clear that floor.\n"
+                "Run `polywatch discover` first, or lower --min-rank-score.")
+        out += [a for a in picked if a not in out]
+    if not out:
+        raise SystemExit("name at least one --trader, or use --from-shortlist N")
+    return out
+
+
+def _build(con, args) -> Task:
     """Flags -> Task. Unset flags fall through to the preset, then to the dataclass default."""
     over: dict = {}
     if args.mirror:
@@ -38,7 +61,12 @@ def _build(args) -> Task:
                          ("poll", "poll_interval_s"), ("session_hours", "session_hours"),
                          ("max_loss", "max_daily_loss_usd"),
                          ("max_drawdown", "max_drawdown_pct"), ("tp_policy", "tp_fee_policy"),
-                         ("min_edge", "min_edge"), ("max_fee_frac", "max_fee_frac")):
+                         ("min_edge", "min_edge"), ("max_fee_frac", "max_fee_frac"),
+                         ("max_spread_frac", "max_spread_frac"),
+                         ("min_depth_usd", "min_depth_usd"),
+                         ("per_trader_usd", "per_trader_usd"),
+                         ("auto_drop_usd", "auto_drop_usd"),
+                         ("min_rank_score", "min_rank_score")):
         v = getattr(args, flag, None)
         if v is not None:
             over[field_] = v
@@ -56,13 +84,15 @@ def _build(args) -> Task:
         over["follow_exit"] = False
     if args.no_flatten:
         over["flatten_on_stop"] = False
-    return Task(name=args.name, trader=args.trader, bankroll=args.bankroll,
+    roster = _roster(con, args)
+    return Task(name=args.name, trader=roster[0], traders=roster, bankroll=args.bankroll,
                 fixed_usd=args.stake, **preset(args.preset, **over))
 
 
 def _create(con, args) -> int:
-    t = _build(args)
+    t = _build(con, args)
     store.upsert_task(con, t.as_row())
+    store.set_task_traders(con, t.name, [{"address": a} for a in t.traders])
     print(f"task {t.name} saved ({t.hold} preset, {t.mode} mode)")
     print(_describe(t))
     return 0
@@ -77,8 +107,13 @@ def _describe(t: Task) -> str:
     # The fee floor is price-dependent, so it is shown at a price rather than as a constant.
     # 0.50 is the worst case and the one that surprises people.
     floor = bk.round_trip_fee_frac(0.50, 0.05)
+    who = ([f"  trader        {t.trader}"] if len(t.traders) == 1 else
+           [f"  traders       {len(t.traders)}, up to ${t.per_trader_cap:,.2f} of risk each"]
+           + [f"                {a}" for a in t.traders]
+           + ([f"                dropped once down ${t.auto_drop_usd:,.2f}"]
+              if t.auto_drop_usd else []))
     return "\n".join(x for x in [
-        f"  trader        {t.trader}",
+        *who,
         f"  stake         {t.buy_method} "
         + (f"${t.fixed_usd:,.2f}" if t.buy_method == "fixed"
            else f"up to {t.mirror_max_frac:.0%} of ${t.bankroll:,.2f}"),
@@ -95,6 +130,9 @@ def _describe(t: Task) -> str:
          ) if t.tp_kind == "pct" else "",
         f"                entries refused above {t.max_fee_frac:.0%} fee"
         if t.max_fee_frac else "",
+        f"  liquidity     spread over {t.max_spread_frac:.0%} of mid is refused"
+        + (f"; ask side must hold ${t.min_depth_usd:,.2f}" if t.min_depth_usd else "")
+        if t.max_spread_frac else "",
         f"  time stop     {t.max_hold_s / 60:.0f} min",
         f"  follow exits  {'yes' if t.follow_exit else 'no'}",
         f"  poll          {t.poll_interval_s:.0f}s, skip signals older than "
@@ -186,11 +224,39 @@ def _run(con, args) -> int:
     # stall inside the loop is a 30-second window with no stop-loss.
     client = Client(con=con, rps=MAX_RPS, dump_raw=False, log_ok=False,
                     timeout=POLL_TIMEOUT_S)
-    eng = Engine(con, t, ex, client)
-    summary = eng.run()
+
+    # A live book feed if the optional extra is installed. It starts with no subscriptions --
+    # a run holds nothing yet -- and picks up each token as a position opens in it.
+    feed = None
+    if not args.no_stream:
+        feed = stream.connect([], log=print)
+        if feed is None and stream_requested(args):
+            print("  book streaming needs the optional extra: "
+                  "uv pip install 'polywatch[stream]'")
+
+    eng = Engine(con, t, ex, client, stream=feed)
+    try:
+        summary = eng.run()
+    except ReconcileError as e:
+        # The banner never printed, because the run refused to start. Say so plainly and leave
+        # the run row closed with its reason, so `task report` explains it too.
+        print(f"\n{e}")
+        last = store.last_run(con, t.name)
+        if last is not None:
+            print()
+            print(report.run_report(con, last["id"], t))
+        return 1
+    finally:
+        if feed is not None:
+            feed.stop()
     print()
     print(report.run_report(con, summary["run_id"], t))
     return 0
+
+
+def stream_requested(args) -> bool:
+    """Did the operator ask for streaming explicitly? Only then is its absence worth a line."""
+    return bool(getattr(args, "stream", False))
 
 
 def _report(con, args) -> int:
@@ -209,8 +275,10 @@ def _report(con, args) -> int:
     if args.json:
         out = store.run_summary(con, run_id)
         out["latency"] = store.latency_stats(con, run_id)
+        out["latency_split"] = store.latency_split(con, run_id)
         out["skips"] = dict(store.skip_reasons(con, run_id))
         out["exits"] = {r[0]: {"n": r[1], "pnl": r[2]} for r in report.exit_mix(con, run_id)}
+        out["by_trader"] = store.trader_pnl(con, run_id)
         print(json.dumps(out, indent=2))
         return 0
     print(report.run_report(con, run_id, t))

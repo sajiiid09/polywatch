@@ -1,233 +1,186 @@
-"""Turning a wallet's settled record into one comparable number.
+"""Turn a pile of metrics into one number, and be explicit about what that number believes.
 
-`screen.py` asks "is this a human?". `skill.py` asks "is this human any good?" and answers with
-six separate metrics. This module answers "which of these humans should we copy?", which needs
-the six collapsed into an ordering.
+Ranking is where the judgement is, so it is kept in one small file with its weights in
+`config.py` rather than spread across the code that computes the inputs. Everything here is pure:
+scores in, score out.
 
-The collapse is a weighted sum with the weights written down in `config.RANK_WEIGHTS`, not a
-fitted model. That is a deliberate limitation: with a few hundred candidates and one leaderboard
-snapshot, anything fitted would be fitted to noise, and a number nobody can argue with is worse
-than a number somebody can. Every weight is a claim about what makes a trader copyable, and a
-reader who disagrees can change one line.
+The shape of the opinion:
 
-Two of the components deserve their reasoning stated rather than assumed.
-
-Calibration dominates at 0.30 because it is the only component that cannot be bought with luck.
-A trader can post a fine ROI on a handful of longshots that happened to land; they cannot post a
-good Brier score across a hundred markets without being genuinely calibrated. And it is scored
-against 0.25 -- the Brier you get by forecasting 0.5 on everything -- so a wallet at or above
-that contributes exactly zero here rather than a small positive amount. The wallet already in
-the database is the cautionary case: +44% ROI on a Brier of 0.371, which is worse than a coin
-flip, and a naive PnL ranking would have put it first.
-
-Everything is normalised across the cohort rather than against absolute targets, because "good
-ROI" only means anything relative to the other wallets available on the same day.
+  * **Copyability dominates.** `capture_ratio` -- how much of a wallet's edge survives one poll
+    interval -- carries more weight than any measure of how good the wallet is, because a great
+    trader we cannot follow is worth exactly zero and a mediocre one we can follow is worth
+    something. A wallet below `MIN_CAPTURE_RATIO` is not ranked at all; it is excluded.
+  * **Consistency over magnitude.** A wallet up in nine months out of ten beats one whose entire
+    record is a single enormous month, at equal total PnL. The target is small wins repeated,
+    not a lottery ticket.
+  * **Evidence over outcome.** A good Brier score is hard to fake and a good ROI is not. A record
+    that cannot be distinguished from luck is discounted however large it is.
+  * **Every component is bounded and directional.** Each sub-score maps to [0, 1] with 0.5 as
+    "unremarkable", so a missing metric can default to 0.5 and neither reward nor punish the
+    wallet for data we did not have. Nothing here can be gamed by making one number enormous.
 """
 
 from __future__ import annotations
 
-import json
 from dataclasses import dataclass
 
-from ..config import BRIER_COINFLIP, RANK_WEIGHTS
+from ..config import (MIN_CAPTURE_RATIO, MIN_SAMPLE_FOR_LUCK, RANK_WEIGHTS)
+
+# Hold times a copier can and cannot work with, in seconds. Under the floor the trade is over
+# before a 15-second poll could have seen it; over the ceiling it is not a flip and the quick-flip
+# machinery is the wrong tool, though the wallet may be perfectly good.
+HOLD_FLOOR_S = 120
+HOLD_IDEAL_S = 1200
+HOLD_CEILING_S = 6 * 3600
+
+
+def _clamp(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
+    return max(lo, min(hi, x))
+
+
+def _ramp(x: float | None, bad: float, good: float, default: float = 0.5) -> float:
+    """Linear score from `bad` (0) to `good` (1). Works in either direction."""
+    if x is None:
+        return default
+    if good == bad:
+        return default
+    return _clamp((x - bad) / (good - bad))
+
+
+def hold_score(p50_s: int | None, p10_s: int | None = None) -> float:
+    """Is this wallet's holding period one a poller can actually work with?
+
+    Peaks in the twenty-minute region: long enough that a fifteen-second copy is still early,
+    short enough that the exit ladder and the session clock mean something. The tenth percentile
+    is a separate penalty, because a wallet with a fine median and a fat tail of forty-second
+    scalps will have those scalps skipped as stale -- which shows up as a low fill rate rather
+    than as a loss, and is easy to miss.
+    """
+    if p50_s is None:
+        return 0.5
+    if p50_s <= HOLD_FLOOR_S:
+        base = _ramp(p50_s, 0, HOLD_FLOOR_S) * 0.3
+    elif p50_s <= HOLD_IDEAL_S:
+        base = 0.3 + 0.7 * _ramp(p50_s, HOLD_FLOOR_S, HOLD_IDEAL_S)
+    else:
+        base = 1.0 - 0.5 * _ramp(p50_s, HOLD_IDEAL_S, HOLD_CEILING_S)
+    if p10_s is not None and p10_s < HOLD_FLOOR_S:
+        base *= 0.75          # a fat tail of uncopyable scalps, whatever the median says
+    return _clamp(base)
+
+
+def brier_score(brier: float | None, n: int) -> float:
+    """0.25 is what guessing 0.5 every time earns, so it is the zero of this scale.
+
+    Discounted toward neutral when the sample is thin: a Brier over four markets is noise wearing
+    the clothes of a measurement.
+    """
+    if brier is None or n <= 0:
+        return 0.5
+    raw = _ramp(brier, 0.25, 0.10)                 # lower is better
+    confidence = _clamp(n / MIN_SAMPLE_FOR_LUCK)
+    return 0.5 + (raw - 0.5) * confidence
+
+
+def luck_score(p: float | None) -> float:
+    """A record indistinguishable from its own variance is discounted, not rejected.
+
+    Rejected would be too strong: a real edge over thirty trades can sit at p = 0.2 and still be
+    real. But it should not outrank a record that is unambiguous.
+    """
+    if p is None:
+        return 0.5
+    return _ramp(p, 0.50, 0.02)                    # lower p is better
 
 
 @dataclass
-class RankedTrader:
+class Ranked:
     address: str
     rank_score: float
+    persona_fit: float | None
     components: dict
-    score: object          # the skill.SkillScore this was computed from
-    est_account_usd: float = 0.0
-    top_category: str | None = None
-
-    def as_row(self) -> dict:
-        s = self.score
-        return {
-            "address": self.address,
-            "n_closed": s.n_closed,
-            "win_rate": s.win_rate,
-            "roi": s.roi,
-            "realized_pnl": s.realized_pnl,
-            "brier": s.brier,
-            "avg_entry_price": s.avg_entry_price,
-            "avg_stake_usd": s.avg_stake_usd,
-            "max_drawdown": s.max_drawdown,
-            "consistency": s.consistency,
-            "est_account_usd": self.est_account_usd,
-            "top_category": self.top_category,
-            "persona_fit": None,
-            "rank_score": self.rank_score,
-            # The normalised components alongside the raw metrics, so a ranking can be argued
-            # with after the fact: "why did this wallet beat that one" is answerable from the
-            # database rather than only by re-running the funnel.
-            "metrics_json": json.dumps({**s.as_row(), "components": self.components},
-                                       sort_keys=True),
-        }
+    excluded: str | None = None                    # why this wallet is not a candidate at all
 
 
-def calibration(brier: float | None, win_rate: float | None = None) -> float:
-    """Brier skill, measured against the trader's own base rate rather than against 0.25.
-
-    The first version of this scored `1 - brier/0.25`, and a live sweep of 3,107 wallets showed
-    exactly what is wrong with that. The entire top twelve came back with a Brier of 0.000 and
-    an average entry price of 0.998: wallets that buy near-certainties at 99.8 cents and collect
-    a dollar. Forecasting 0.999 on something that resolves 1 produces a near-perfect Brier, but
-    it demonstrates no judgement at all -- the market had already done the forecasting, and the
-    trader is collecting a spread. Against a fixed 0.25 reference they scored a perfect 1.0 and
-    swept the shortlist.
-
-    The standard correction is a skill score: compare the forecast against the best you could do
-    knowing only how often this trader's positions win. A trader who wins 99.9% of the time has
-    a reference Brier of p(1-p) ~= 0.001, so predicting 0.999 every time beats nothing and earns
-    nothing here. A trader calling coin-flip markets at 60% has a reference of 0.24, and beating
-    that is real evidence.
-
-    Falls back to the fixed 0.25 reference when the base rate is unknown, and returns 0 when the
-    reference is so small that no forecast could show skill against it.
-    """
-    if brier is None:
-        return 0.0
-    reference = BRIER_COINFLIP if win_rate is None else win_rate * (1.0 - win_rate)
-    # A base rate this lopsided leaves no room to demonstrate anything: every outcome was a
-    # foregone conclusion, so calibration carries no information either way.
-    if reference < 0.01:
-        return 0.0
-    return max(0.0, min(1.0, 1.0 - brier / reference))
+def _usable(replay) -> bool:
+    """Does this replay have enough price coverage to be allowed an opinion?"""
+    return replay is not None and getattr(replay, "trustworthy", True)
 
 
-def raw_components(score) -> dict:
-    """The five components for one wallet, before cohort normalisation.
-
-    Each is oriented so that larger is better -- drawdown and Brier are both inverted here so
-    the weighted sum never has to carry a minus sign, which is exactly the kind of detail that
-    silently flips a ranking.
-    """
+def components(sc, replay=None) -> dict:
+    """Every sub-score, kept separately so a ranking can be explained rather than trusted."""
+    usable = _usable(replay)
+    capture = replay.capture_ratio if usable else None
+    half_life = replay.edge_half_life_s if usable else None
     return {
-        "calibration": calibration(score.brier, score.win_rate),
-        "consistency": score.consistency,
-        "roi": score.roi,
-        "drawdown": 1.0 - score.max_drawdown,
-        "evidence": min(score.n_closed / 100.0, 1.0),
+        # Copyability: the two numbers only replay can produce.
+        "capture": _ramp(capture, 0.0, 0.60),
+        "persistence": _ramp(half_life, 60.0, 900.0),
+        "hold": hold_score(sc.hold_p50_s, sc.hold_p10_s),
+        # Quality of the record itself.
+        "brier": brier_score(sc.brier, sc.n_brier),
+        "consistency": _clamp(sc.consistency),
+        "luck": luck_score(sc.luck_p),
+        # Return, after fees and weighted toward recent form. Capped well below what an
+        # exceptional wallet posts, so an outlier cannot buy its way past the other components.
+        "fee_roi": _ramp(sc.fee_adjusted_roi, 0.0, 0.25),
+        "recent": _ramp(sc.recent_roi, -0.05, 0.20),
+        # Drawdown is a disqualifier rather than a virtue: it is measured on realized PnL and so
+        # cannot see paper losses they sat through. A good number here is only mildly reassuring.
+        "drawdown": 1.0 - _ramp(sc.max_drawdown, 0.0, 0.60),
     }
 
 
-def normalise(values: list[float]) -> list[float]:
-    """Min-max a component across the cohort, onto 0..1.
+def rank(sc, replay=None, weights: dict | None = None) -> Ranked:
+    """One wallet's rank score, with the reason it was excluded when it was.
 
-    A cohort where every wallet scores identically -- including a cohort of one -- returns 0.5
-    for all of them rather than dividing by zero. Not 1.0: a component that separates nobody
-    should not hand everybody full marks and quietly dominate the sum.
+    Exclusions are hard gates rather than heavy penalties, because they are statements about
+    whether the wallet is a candidate at all -- not about how good a candidate it is.
     """
-    if not values:
-        return []
-    lo, hi = min(values), max(values)
-    if hi - lo < 1e-12:
-        return [0.5] * len(values)
-    return [(v - lo) / (hi - lo) for v in values]
+    w = weights or RANK_WEIGHTS
+    comp = components(sc, replay)
+
+    # A replay drawn through a minority of a wallet's round trips does not get to exclude it.
+    # Thin coverage is a fact about which price windows we happen to have fetched, not about the
+    # trader, and acting on it would quietly reject wallets for being unfamiliar.
+    verdict = replay if _usable(replay) else None
+
+    excluded = None
+    if sc.n_closed < MIN_SAMPLE_FOR_LUCK:
+        excluded = f"only {sc.n_closed} settled positions"
+    elif verdict is not None and verdict.capture_ratio is not None \
+            and verdict.capture_ratio < MIN_CAPTURE_RATIO:
+        excluded = (f"capture ratio {verdict.capture_ratio:.2f} -- their edge does not survive "
+                    f"being copied")
+    elif verdict is not None and verdict.edge_half_life_s is not None \
+            and verdict.edge_half_life_s < 60:
+        excluded = f"edge half-life {verdict.edge_half_life_s:.0f}s -- gone before we could act"
+
+    total = sum(comp[k] * w.get(k, 0.0) for k in comp)
+    denom = sum(w.get(k, 0.0) for k in comp) or 1.0
+    return Ranked(sc.address, _clamp(total / denom), None, comp, excluded)
 
 
-def rank(scores: list, accounts: dict | None = None,
-         categories: dict | None = None) -> list[RankedTrader]:
-    """Rank a cohort of skill.SkillScore objects, best first.
+def persona_fit(sc, task_like) -> float:
+    """How well a wallet matches the shape of task someone wants to run.
 
-    Normalisation is per-cohort, so this is only meaningful over wallets scored on the same
-    window -- ranking a wallet scored today against one scored last month would compare their
-    positions in two different fields.
+    Separate from `rank_score` on purpose: rank says whether a wallet is any good, fit says
+    whether it is good *for this*. A superb slow-thesis trader ranks well and fits a quick-flip
+    task badly, and collapsing the two would hide that.
     """
-    if not scores:
-        return []
-    accounts = accounts or {}
-    categories = categories or {}
+    score = 1.0
+    want_hold = getattr(task_like, "hold", None)
+    if want_hold == "quick_flips":
+        score *= hold_score(sc.hold_p50_s, sc.hold_p10_s)
+    elif want_hold == "hours" and sc.hold_p50_s is not None:
+        score *= _clamp(_ramp(sc.hold_p50_s, HOLD_FLOOR_S, HOLD_CEILING_S))
 
-    raw = [raw_components(s) for s in scores]
-    normed = {k: normalise([r[k] for r in raw]) for k in RANK_WEIGHTS}
-
-    out = []
-    for i, s in enumerate(scores):
-        components = {k: normed[k][i] for k in RANK_WEIGHTS}
-        total = sum(RANK_WEIGHTS[k] * components[k] for k in RANK_WEIGHTS)
-        out.append(RankedTrader(
-            address=s.address, rank_score=total, components=components, score=s,
-            est_account_usd=accounts.get(s.address, 0.0),
-            top_category=categories.get(s.address),
-        ))
-    out.sort(key=lambda r: r.rank_score, reverse=True)
-    return out
-
-
-def copyable(score, band: tuple[float, float], stake_usd: float,
-             min_shares: float = 5.0) -> tuple[bool, str | None]:
-    """Can this trader be followed at all, at our bankroll and settings?
-
-    Ranking a wallet we cannot copy is worse than useless -- it fills the shortlist and pushes
-    out wallets we could have followed. The live sweep produced twelve finalists in a row that
-    the engine then skipped every single trade of, so this check exists to run *before* the
-    expensive validation rather than to explain its emptiness afterwards.
-
-    Two independent reasons a trader is out of reach:
-
-      price   their entries sit outside the style/risk band, so every gate rejects them;
-      size    Polymarket's ~5 share minimum means an entry at price p costs at least 5p, and
-              below that our stake cannot place the order at all. At a $2 stake nothing above
-              $0.40 is reachable -- which is a fact about the bankroll, not about the trader.
-    """
-    lo, hi = band
-    entry = score.avg_entry_price
-    if not lo <= entry <= hi:
-        return False, f"average entry {entry:.3f} sits outside the {lo:.2f}-{hi:.2f} band"
-    if entry * min_shares > stake_usd:
-        return False, (f"entry {entry:.3f} needs ${entry * min_shares:.2f} to clear the "
-                       f"{min_shares:.0f}-share minimum, above the ${stake_usd:.2f} stake")
-    return True, None
-
-
-def from_stored(rows: list[dict]) -> tuple[list, dict]:
-    """Rebuild (skill scores, account values) from persisted `trader_scores` rows.
-
-    `metrics_json` holds the whole SkillScore as written, so a ranking can be recomputed after
-    the formula changes without touching the network.
-    """
-    from .skill import SkillScore
-    fields = SkillScore.__dataclass_fields__
-    scores, accounts = [], {}
-    for row in rows:
-        try:
-            m = json.loads(row["metrics_json"] or "{}")
-        except (TypeError, json.JSONDecodeError):
-            continue
-        m.pop("components", None)
-        if not all(f in m for f in ("address", "n_closed")):
-            continue
-        scores.append(SkillScore(**{k: m[k] for k in fields if k in m}))
-        accounts[row["address"]] = row.get("est_account_usd") or 0.0
-    return scores, accounts
-
-
-def disqualifiers(r: RankedTrader) -> list[str]:
-    """Reasons this wallet should not be copied, regardless of where it ranked.
-
-    Separate from the score on purpose. A weighted sum will happily average a fatal flaw away --
-    a wallet with a coin-flip Brier can still finish mid-table on ROI and consistency alone --
-    so the fatal flaws are checked as flags rather than as weights.
-    """
-    out = []
-    s = r.score
-    if s.brier is None:
-        out.append("no settled positions to calibrate against")
-    elif s.brier >= BRIER_COINFLIP:
-        out.append(f"brier {s.brier:.3f} is no better than guessing 50/50")
-    if s.roi <= 0:
-        out.append(f"roi {s.roi:+.1%} over the ranking window")
-    elif s.roi < 0.02:
-        # A sub-2% return per dollar deployed is inside the fee schedule. Copying it converts a
-        # thin real edge into a reliable loss.
-        out.append(f"roi {s.roi:+.2%} is thinner than the ~4% taker fee round trip")
-    if s.avg_entry_price > 0.95:
-        out.append(f"average entry {s.avg_entry_price:.3f} -- buying near-certainties, which "
-                   "needs size rather than judgement")
-    if s.max_drawdown > 0.5:
-        out.append(f"drawdown {s.max_drawdown:.0%} of capital staked")
-    if s.consistency < 0.5:
-        out.append(f"only {s.consistency:.0%} of months finished in profit")
-    return out
+    want_cat = getattr(task_like, "category", None)
+    if want_cat:
+        if sc.top_category == want_cat:
+            score *= 0.7 + 0.3 * _clamp(sc.category_concentration or 0.0)
+        else:
+            score *= 0.5
+    if getattr(task_like, "risk", None) == "conservative":
+        score *= 1.0 - 0.5 * _ramp(sc.max_drawdown, 0.0, 0.60)
+    return _clamp(score)

@@ -112,16 +112,37 @@ def round_to_tick(price: float, tick: float = TICK_SIZE_FALLBACK, *, side: str =
     return max(tick, min(1.0 - tick, out))
 
 
-def limit_price(vwap: float, slippage: float, tick: float = TICK_SIZE_FALLBACK,
+def limit_price(reference: float, slippage: float, tick: float = TICK_SIZE_FALLBACK,
                 side: str = "BUY") -> float:
-    """The price to actually sign: the book's VWAP plus a slippage allowance, on-tick.
+    """The price to actually sign: the touch plus a slippage allowance, on-tick.
 
-    A copy order is a taker order racing whoever else saw the same fill, so it is priced
-    through the book rather than at it. `slippage` is fractional: 0.07 accepts paying 7% more
-    per share than the walk said, and refusing anything worse.
+    A copy order is a taker order racing whoever else saw the same fill, so it is priced through
+    the book rather than at it. `slippage` is fractional: 0.07 accepts paying 7% more per share
+    than the reference, and refusing anything worse.
+
+    `reference` is the **touch** -- the best ask when buying, the best bid when selling -- and
+    not the VWAP of our own walk. The distinction matters on a thin book. The walk's VWAP already
+    includes the impact of our own size, so allowing 7% on top of it permits impact *and* 7%,
+    which on a book with two levels can be far worse than the 7% the operator asked for. Priced
+    off the touch, the allowance means what it says, and an order too large for the book fills
+    partially instead of paying through it -- which is the outcome we would have chosen anyway.
     """
-    adj = vwap * (1 + slippage) if side.upper() == "BUY" else vwap * (1 - slippage)
+    adj = reference * (1 + slippage) if side.upper() == "BUY" else reference * (1 - slippage)
     return round_to_tick(adj, tick, side=side)
+
+
+def spread_frac(book: dict) -> float | None:
+    """The spread as a fraction of the mid -- what crossing it costs, in the same unit as fees.
+
+    Directly comparable to `round_trip_fee_frac`, and for the same reason: both are costs a round
+    trip pays before the trade is right about anything. A 1-cent spread is 2% of the price at
+    0.50 and 20% of it at 0.05, which is why this is a fraction rather than an absolute.
+    """
+    b, a = best_bid(book), best_ask(book)
+    if b is None or a is None:
+        return None
+    m = (a + b) / 2
+    return (a - b) / m if m > 0 else None
 
 
 def fee(shares: float, price: float, rate: float, exponent: float = FEE_EXPONENT_DEFAULT) -> float:

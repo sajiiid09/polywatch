@@ -20,16 +20,21 @@ from dataclasses import asdict, dataclass, field, fields
 from . import book as bk
 from ..config import (DEFAULT_BANKROLL_USD, DEFAULT_MAX_CONCURRENT, DEFAULT_MAX_DAILY_LOSS_USD,
                       DEFAULT_MAX_DRAWDOWN_PCT, DEFAULT_MAX_FEE_FRAC, DEFAULT_MAX_HOLD_S,
-                      DEFAULT_MAX_MARKET_USD, DEFAULT_MIN_EDGE,
-                      DEFAULT_SLIPPAGE, DEFAULT_STOP_LOSS_PCT, DEFAULT_TAKE_PROFIT_PCT,
-                      DEFAULT_TRAIL_PCT, MAX_ENTRY_PRICE, MAX_SIGNAL_AGE_S, MIN_ENTRY_PRICE,
+                      DEFAULT_MAX_MARKET_USD, DEFAULT_MAX_SPREAD_FRAC, DEFAULT_MIN_DEPTH_USD,
+                      DEFAULT_MIN_EDGE,
+                      DEFAULT_SLIPPAGE, DEFAULT_STOP_LOSS_PCT, DEFAULT_TRAIL_PCT,
+                      MAX_ENTRY_PRICE, MAX_SIGNAL_AGE_S, MIN_ENTRY_PRICE,
                       MIN_SECONDS_TO_CLOSE, POLL_INTERVAL_S, SESSION_MAX_HOURS)
 
 
 @dataclass
 class Task:
     name: str
+    # `trader` is the first wallet and stays a plain string so that every saved task, every SQL
+    # query and every report written before this file learned to count keeps working. `traders`
+    # is the real roster; the two are kept in step by __post_init__.
     trader: str
+    traders: list[str] = field(default_factory=list)
     mode: str = "paper"                     # 'paper' | 'live'
     bankroll: float = DEFAULT_BANKROLL_USD
 
@@ -42,14 +47,27 @@ class Task:
     max_market_usd: float = DEFAULT_MAX_MARKET_USD
     max_concurrent: int = DEFAULT_MAX_CONCURRENT
     slippage: float = DEFAULT_SLIPPAGE
+    # Ceiling on what any one trader's signals can have at risk at once. 0 means "an equal share
+    # of the bankroll", which with a single trader is the whole bankroll -- i.e. exactly the
+    # behaviour of a task written before this existed.
+    per_trader_usd: float = 0.0
+    # Stop copying a trader after their signals have lost this much within a run. Their open
+    # positions are still managed to the end: this is a decision to stop taking their advice,
+    # not to abandon the trades already made on it. 0 disables.
+    auto_drop_usd: float = 0.0
+    # Floor on rank_score when a roster is built from the discovery shortlist.
+    min_rank_score: float = 0.0
 
     # --- exits --------------------------------------------------------------------------
     # sl_kind/tp_kind: 'pct' measures off the average entry price, 'price' is an absolute
     # 0..1 level, None disables the rung.
     sl_kind: str | None = "pct"
     sl_value: float | None = DEFAULT_STOP_LOSS_PCT
-    tp_kind: str | None = "pct"
-    tp_value: float | None = DEFAULT_TAKE_PROFIT_PCT
+    # No take-profit by default. The note at the bottom of this file measures what one costs:
+    # a fixed target truncates exactly the tail that pays for the losers. Leaving the dataclass
+    # default at 'pct' contradicted that finding for anyone constructing a Task without a preset.
+    tp_kind: str | None = None
+    tp_value: float | None = None
     # A percentage take-profit is meaningless until it clears both taker fees, and what it has
     # to clear depends on the entry price: a round trip costs 10% of stake at 0.50 and 1% at
     # 0.90. `tp_fee_policy` says what to do when the configured target is under that floor.
@@ -79,6 +97,11 @@ class Task:
     max_price: float = MAX_ENTRY_PRICE
     min_seconds_to_close: int = MIN_SECONDS_TO_CLOSE
     min_trade_usd: float = 0.0              # ignore the trader's own dust
+    # Liquidity. Checked against the real book before a copy is recorded as copied, so that a
+    # market too thin to trade shows up in the skip histogram as illiquidity rather than as a
+    # rejected order nobody reads.
+    max_spread_frac: float = DEFAULT_MAX_SPREAD_FRAC
+    min_depth_usd: float = DEFAULT_MIN_DEPTH_USD
 
     # --- run bounds ---------------------------------------------------------------------
     poll_interval_s: float = POLL_INTERVAL_S
@@ -99,6 +122,17 @@ class Task:
 
     def __post_init__(self) -> None:
         self.trader = self.trader.lower()
+        # One roster, however it was specified. Duplicates are dropped rather than rejected --
+        # the same wallet topping two leaderboards is how it gets named twice.
+        seen: list[str] = []
+        for addr in [self.trader, *(self.traders or [])]:
+            a = (addr or "").lower()
+            if a and a not in seen:
+                seen.append(a)
+        self.traders = seen
+        self.trader = seen[0] if seen else self.trader
+        if not self.traders:
+            raise ValueError("a task must copy at least one trader")
         if self.mode not in ("paper", "live"):
             raise ValueError(f"mode must be paper or live, got {self.mode!r}")
         if self.buy_method not in ("fixed", "mirror"):
@@ -124,6 +158,8 @@ class Task:
             "name", "trader", "mode", "bankroll", "buy_method", "fixed_usd", "max_market_usd",
             "max_concurrent", "slippage", "sl_kind", "sl_value", "tp_kind", "tp_value",
             "behavior", "risk", "category", "style", "hold", "activity")}
+        # The denormalised `trader` column keeps naming the first wallet. The roster lives in
+        # config_json and in task_traders; nothing reads the column expecting more than a label.
         row["config_json"] = json.dumps(d, sort_keys=True)
         return row
 
@@ -139,6 +175,18 @@ class Task:
         return cls(**{k: v for k, v in cfg.items() if k in known})
 
     # --- derived ------------------------------------------------------------------------
+
+    @property
+    def per_trader_cap(self) -> float:
+        """What one trader's signals may have at risk at once.
+
+        Defaulting to an equal share of the bankroll makes the cap mean something without
+        anyone configuring it, and collapses to "no cap" for a single-trader task, which is what
+        every task written before this existed expects.
+        """
+        if self.per_trader_usd > 0:
+            return self.per_trader_usd
+        return self.bankroll / max(1, len(self.traders))
 
     def stake_usd(self, trader_usd: float, trader_account_usd: float) -> float:
         """What to spend copying a trade of `trader_usd` by an account worth

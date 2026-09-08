@@ -150,3 +150,58 @@ CLOB_CHAIN_ID = 137                      # Polygon mainnet
 # of the stake, which no exit rule can undo.
 DEFAULT_MIN_EDGE = 0.02
 DEFAULT_MAX_FEE_FRAC = 0.12
+
+# Liquidity floor. The spread is the other cost a round trip pays before the trade is right about
+# anything, and it is expressed as a fraction of the mid so it reads in the same unit as the fee
+# floor above: 10% here is the same size of problem as a 10% round-trip fee. A book this wide is
+# not a market a copier can flip in, whatever the trader saw in it.
+DEFAULT_MAX_SPREAD_FRAC = 0.10
+# Absolute depth demanded on the side we are about to take, over and above being able to fill our
+# own stake. 0 means "just enough for us", which is the honest default at a $10 stake -- there is
+# no point demanding a deep book to spend ten dollars.
+DEFAULT_MIN_DEPTH_USD = 0.0
+
+# How many pages of /activity one poll will read before giving up and calling the read truncated.
+# Each page is ACTIVITY_PAGE events; five of them is 500 events in one poll interval, which is far
+# past any human and well past the point where copying is the right response.
+MAX_ACTIVITY_PAGES = 5
+
+
+# --- Trader evaluation ----------------------------------------------------------------------
+
+# Below this many settled positions a wallet's record is not evidence of anything, and a
+# significance test over it is theatre. Reported as None rather than as a flattering number.
+MIN_SAMPLE_FOR_LUCK = 20
+
+# Copy lags to replay a candidate's history at, in seconds. 0 is the trader themselves, charged
+# our fees; 15 is one poll interval, which is the honest expectation; 900 is there to show where
+# the edge is definitively gone rather than because anyone would copy that late.
+REPLAY_LAGS = (0, 15, 30, 60, 300, 900)
+# The lag a candidate is judged at -- one poll interval, the cadence the bot actually runs.
+REPLAY_REFERENCE_LAG = 15
+
+# How much of the trader's own edge has to survive one poll interval before copying them is
+# worth doing at all. Below this the wallet may be excellent and is still not a candidate.
+MIN_CAPTURE_RATIO = 0.30
+
+# Share of a wallet's round trips that must resolve to a price at both ends before the replay is
+# allowed to decide anything about it. Price history is fetched in windows around known trades,
+# so a wallet whose exits fall outside those windows produces a curve drawn through a minority of
+# its own trades -- which is not a reason to exclude it, and not a reason to trust it either.
+MIN_REPLAY_COVERAGE = 0.30
+
+# What ranking believes, in one place. Copyability outweighs quality because a great trader we
+# cannot follow is worth zero, and evidence outweighs return because a good Brier is hard to fake
+# and a good ROI is not. Every component is already bounded to [0, 1] by rank.py, so these are
+# relative importances and nothing more -- they do not need to sum to anything.
+RANK_WEIGHTS = {
+    "capture": 3.0,        # how much of their edge survives one poll interval
+    "persistence": 2.0,    # how long it survives at all
+    "hold": 2.0,           # is their holding period one a poller can work with
+    "brier": 2.0,          # calibration: the one metric that measures judgement
+    "consistency": 2.0,    # months in profit, not one enormous month
+    "luck": 1.5,           # distinguishable from their own variance
+    "fee_roi": 1.5,        # return after both taker fees
+    "recent": 1.0,         # recent form over lifetime
+    "drawdown": 1.0,       # a disqualifier, not a virtue
+}
