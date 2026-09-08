@@ -275,8 +275,10 @@ def _report(con, args) -> int:
     if args.json:
         out = store.run_summary(con, run_id)
         out["latency"] = store.latency_stats(con, run_id)
+        out["latency_split"] = store.latency_split(con, run_id)
         out["skips"] = dict(store.skip_reasons(con, run_id))
         out["exits"] = {r[0]: {"n": r[1], "pnl": r[2]} for r in report.exit_mix(con, run_id)}
+        out["by_trader"] = store.trader_pnl(con, run_id)
         print(json.dumps(out, indent=2))
         return 0
     print(report.run_report(con, run_id, t))

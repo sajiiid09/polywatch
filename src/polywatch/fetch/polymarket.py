@@ -49,14 +49,6 @@ def trades(client: Client, user: str, offset: int = 0, limit: int = TRADES_PAGE)
     )
 
 
-def trades_feed(client: Client, offset: int = 0, limit: int = TRADES_PAGE) -> list:
-    """The global trades feed, no user filter. Step 5's sampling frame for control wallets."""
-    return client.get_json(
-        f"{DATA_API}/trades", {"limit": limit, "offset": offset},
-        kind="trades_feed", raw_name=f"offset_{offset}",
-    )
-
-
 def markets_by_condition(client: Client, condition_ids: list[str], closed: bool | None = None) -> list:
     """Market metadata for a batch of condition ids.
 
@@ -162,12 +154,6 @@ def portfolio_value(client: Client, user: str) -> list:
                            kind="value", raw_name=user)
 
 
-def traded_count(client: Client, user: str) -> dict:
-    """Lifetime trade count for a wallet, as {user, traded}."""
-    return client.get_json(f"{DATA_API}/traded", {"user": user},
-                           kind="traded", raw_name=user)
-
-
 def book(client: Client, token_id: str, dump_raw: bool | None = None) -> dict:
     """Full order book for one CLOB token: {bids: [{price, size}], asks: [...]}.
 
@@ -177,6 +163,26 @@ def book(client: Client, token_id: str, dump_raw: bool | None = None) -> dict:
     """
     return client.get_json(f"{CLOB}/book", {"token_id": token_id},
                            kind="book", raw_name=token_id[:24], dump_raw=dump_raw)
+
+
+# --- probed and verified, not currently called ---------------------------------------------
+# No caller today. Kept rather than deleted because each docstring records something that was
+# established by probing the live API on a date -- the page caps, the parameter names the
+# server silently drops, where the real category taxonomy lives -- and re-deriving that costs
+# far more than four functions cost to carry. Anything here that gains a caller moves back up.
+
+def trades_feed(client: Client, offset: int = 0, limit: int = TRADES_PAGE) -> list:
+    """The global trades feed, no user filter. Step 5's sampling frame for control wallets."""
+    return client.get_json(
+        f"{DATA_API}/trades", {"limit": limit, "offset": offset},
+        kind="trades_feed", raw_name=f"offset_{offset}",
+    )
+
+
+def traded_count(client: Client, user: str) -> dict:
+    """Lifetime trade count for a wallet, as {user, traded}."""
+    return client.get_json(f"{DATA_API}/traded", {"user": user},
+                           kind="traded", raw_name=user)
 
 
 def tick_size(client: Client, token_id: str) -> dict:

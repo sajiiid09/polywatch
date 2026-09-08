@@ -42,6 +42,14 @@ MAX_BOOK_AGE_S = 20.0
 RECONNECT_BASE_S = 1.0
 RECONNECT_CAP_S = 30.0
 
+# Connecting should be quick; reading should not be. Polymarket pushes on change, so a book that
+# nobody is trading sends nothing for minutes at a stretch -- and a read timeout applied to that
+# silence tears down a perfectly good connection, drops every cached book, and reconnects into
+# the same silence. The read timeout is therefore a heartbeat interval, not a failure: when it
+# fires we send a PING and carry on.
+CONNECT_TIMEOUT_S = 10.0
+READ_TIMEOUT_S = 10.0
+
 
 def available() -> bool:
     """Is the optional websocket dependency installed?"""
@@ -71,6 +79,7 @@ class BookStream:
         self._stop = threading.Event()
         self.updates = 0
         self.connects = 0
+        self.pings = 0
         # Set whenever a book changes, so a caller can wait for movement instead of sleeping
         # through it. Cleared by whoever consumes it.
         self.changed = threading.Event()
@@ -143,14 +152,23 @@ class BookStream:
         delay = RECONNECT_BASE_S
         while not self._stop.is_set():
             try:
-                self._ws = websocket.create_connection(self.url, timeout=10)
+                self._ws = websocket.create_connection(self.url, timeout=CONNECT_TIMEOUT_S)
                 self._ws.send(json.dumps({"assets_ids": sorted(self._tokens), "type": "market"}))
+                self._ws.settimeout(READ_TIMEOUT_S)
                 self.connects += 1
                 delay = RECONNECT_BASE_S
                 while not self._stop.is_set():
-                    raw = self._ws.recv()
+                    try:
+                        raw = self._ws.recv()
+                    except websocket.WebSocketTimeoutException:
+                        # Silence, not death. Keep the connection warm and go round again.
+                        self._ws.send("PING")
+                        self.pings += 1
+                        continue
                     if not raw:
                         break
+                    if raw == "PONG":
+                        continue
                     self._ingest(raw)
             except Exception as e:  # noqa: BLE001 - a dead socket is a fallback, not a crash
                 if self._stop.is_set():

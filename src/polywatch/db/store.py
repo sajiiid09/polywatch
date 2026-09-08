@@ -472,15 +472,6 @@ def insert_signal(con: sqlite3.Connection, row: dict) -> int | None:
     return int(cur.lastrowid) if cur.rowcount else None
 
 
-def signal_seen(con: sqlite3.Connection, run_id: int, tx_hash: str, token_id: str,
-                side: str | None, size: float | None) -> bool:
-    return con.execute(
-        """SELECT 1 FROM signals
-           WHERE run_id=? AND tx_hash=? AND token_id=? AND side IS ? AND size IS ?""",
-        (run_id, tx_hash, token_id, side, size),
-    ).fetchone() is not None
-
-
 def signals(con: sqlite3.Connection, run_id: int, action: str | None = None
             ) -> list[sqlite3.Row]:
     sql = "SELECT * FROM signals WHERE run_id=?"

@@ -285,3 +285,54 @@ def test_a_dead_stream_is_the_same_as_no_stream(con):
     started = time.monotonic()
     eng._wait(0.05)
     assert time.monotonic() - started >= 0.04
+
+
+def test_silence_on_the_socket_is_a_heartbeat_not_a_disconnect(monkeypatch):
+    """Polymarket pushes on change, so a book nobody is trading sends nothing for minutes. A
+    read timeout applied to that silence tore down a good connection, dropped every cached book
+    and reconnected into the same silence -- which a live run hit within two minutes."""
+    import websocket
+
+    class QuietSocket:
+        def __init__(self):
+            self.sent = []
+            self.recvs = 0
+
+        def send(self, msg):
+            self.sent.append(msg)
+
+        def settimeout(self, _t):
+            pass
+
+        def recv(self):
+            self.recvs += 1
+            if self.recvs <= 3:
+                raise websocket.WebSocketTimeoutException("Connection timed out")
+            return snapshot()
+
+        def close(self):
+            pass
+
+    sock = QuietSocket()
+    made = {"n": 0}
+
+    def create_connection(url, timeout=None):
+        made["n"] += 1
+        if made["n"] > 1:
+            raise RuntimeError("the socket should not have been rebuilt")
+        return sock
+
+    monkeypatch.setattr(websocket, "create_connection", create_connection)
+
+    s = a_stream()
+    s._tokens = {"tok"}
+    s.start(["tok"])
+    for _ in range(200):
+        if s.book("tok") is not None:
+            break
+        time.sleep(0.01)
+    s.stop()
+
+    assert s.connects == 1, "the connection was torn down and rebuilt"
+    assert s.pings == 3, "each timeout should have sent a keepalive"
+    assert s.book("tok") is not None, "the book that arrived after the silence was lost"

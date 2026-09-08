@@ -296,8 +296,10 @@ class Engine:
 
     def banner(self) -> str:
         t, s = self.task, self.state
-        sl = "none" if t.sl_kind is None else f"{t.sl_kind} {t.sl_value}"
-        tp = "none" if t.tp_kind is None else f"{t.tp_kind} {t.tp_value}"
+        sl = ("none" if t.sl_kind is None else
+              (f"-{t.sl_value:.0%} off entry" if t.sl_kind == "pct" else f"at {t.sl_value:.3f}"))
+        tp = ("none -- exits follow the trader, the trail and the stop" if t.tp_kind is None else
+              (f"+{t.tp_value:.0%} off entry" if t.tp_kind == "pct" else f"at {t.tp_value:.3f}"))
         return "\n".join([
             f"run {s.run_id}  task {t.name}  mode {t.mode.upper()}",
             (f"  trader        {t.trader}" if len(t.traders) == 1 else
@@ -310,7 +312,7 @@ class Engine:
             f"  session       {t.session_hours:.1f}h, then "
             f"{'flatten' if t.flatten_on_stop else 'leave positions open'}",
             f"  stop-loss     {sl}   take-profit {tp}"
-            f"{'  (resting GTC order on the book)' if t.resting_tp else ''}",
+            f"{'  (resting GTC order on the book)' if t.resting_tp and t.tp_kind else ''}",
             f"  trailing      {t.trail_pct:.0%}   max hold {t.max_hold_s / 60:.0f}m   "
             f"follow trader's exits: {'yes' if t.follow_exit else 'no'}",
             f"  breakers      -${t.max_daily_loss_usd:,.2f} or -{t.max_drawdown_pct:.0%}",
