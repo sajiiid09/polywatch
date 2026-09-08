@@ -264,6 +264,23 @@ def condition_ids_in_trades(con: sqlite3.Connection, selected_only: bool = False
     return {r[0] for r in con.execute(sql)}
 
 
+def condition_ids_for_wallets(con: sqlite3.Connection, wallets: Sequence[str]) -> set[str]:
+    """Condition ids traded by specific wallets.
+
+    The narrow counterpart to `condition_ids_in_trades(selected_only=True)`. Walk-forward
+    validation only needs market metadata for the one candidate being validated, and the wide
+    version would pull every market touched by every screened wallet -- measured on a real
+    sweep, 122,277 unfetched markets and roughly twelve thousand requests, to backtest one
+    wallet that traded a few hundred of them.
+    """
+    if not wallets:
+        return set()
+    marks = ",".join("?" * len(wallets))
+    return {r[0] for r in con.execute(
+        f"SELECT DISTINCT condition_id FROM trades WHERE wallet IN ({marks})",
+        [w.lower() for w in wallets])}
+
+
 def trade_times_by_token(con: sqlite3.Connection, selected_only: bool = False
                          ) -> dict[str, list[int]]:
     if selected_only:
@@ -418,16 +435,17 @@ def trader_realized(con: sqlite3.Connection, run_id: int, trader: str) -> float:
 def start_run(con: sqlite3.Connection, task: str, mode: str, bankroll: float) -> int:
     cur = con.execute(
         "INSERT INTO task_runs (task, mode, started_at, start_bankroll) VALUES (?,?,?,?)",
-        (task, mode, int(time.time()), bankroll),
+        (task, mode, int(time.time()) if started_at is None else started_at, bankroll),
     )
     con.commit()
     return int(cur.lastrowid)
 
 
-def finish_run(con: sqlite3.Connection, run_id: int, end_bankroll: float, reason: str) -> None:
+def finish_run(con: sqlite3.Connection, run_id: int, end_bankroll: float, reason: str,
+               stopped_at: int | None = None) -> None:
     con.execute(
         "UPDATE task_runs SET stopped_at=?, end_bankroll=?, stop_reason=? WHERE id=?",
-        (int(time.time()), end_bankroll, reason, run_id),
+        (int(time.time()) if stopped_at is None else stopped_at, end_bankroll, reason, run_id),
     )
     con.commit()
 

@@ -1,0 +1,516 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>polywatch console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;500;600&family=Fira+Sans:wght@300;400;500;600&display=swap" rel="stylesheet">
+<style>
+:root{
+  --bg:#020617; --surface:#0F172A; --raised:#1E293B; --line:#1E293B; --line-hi:#334155;
+  --text:#F8FAFC; --muted:#94A3B8; --dim:#64748B;
+  --up:#22C55E; --down:#EF4444; --warn:#F59E0B; --info:#38BDF8;
+  --mono:'Fira Code',ui-monospace,Menlo,monospace;
+  --sans:'Fira Sans',system-ui,-apple-system,sans-serif;
+}
+*{box-sizing:border-box;border-radius:0!important}
+html,body{margin:0;padding:0}
+body{background:var(--bg);color:var(--text);font-family:var(--sans);font-size:15px;line-height:1.55;-webkit-font-smoothing:antialiased}
+h1,h2,h3{font-weight:600;margin:0;letter-spacing:-.01em}
+a{color:var(--info)}
+code,.mono,td.num,th.num{font-family:var(--mono);font-variant-numeric:tabular-nums}
+
+/* layout */
+.shell{display:grid;grid-template-columns:212px 1fr;min-height:100vh}
+nav{background:var(--surface);border-right:1px solid var(--line);padding:20px 0;position:sticky;top:0;height:100vh;overflow:auto}
+.brand{padding:0 20px 18px;border-bottom:1px solid var(--line);margin-bottom:14px}
+.brand b{font-size:17px;letter-spacing:.02em}
+.brand span{display:block;color:var(--dim);font-size:11px;font-family:var(--mono);margin-top:3px}
+nav button{display:flex;align-items:center;gap:10px;width:100%;background:none;border:0;border-left:2px solid transparent;color:var(--muted);font:500 14px/1 var(--sans);padding:11px 20px;cursor:pointer;transition:color .18s,background .18s,border-color .18s;text-align:left;min-height:44px}
+nav button:hover{color:var(--text);background:#0b1424}
+nav button[aria-current="true"]{color:var(--text);background:#0b1424;border-left-color:var(--up)}
+nav button:focus-visible,button:focus-visible,input:focus-visible,select:focus-visible,tr:focus-visible{outline:2px solid var(--info);outline-offset:1px}
+nav svg{width:16px;height:16px;flex:none;stroke:currentColor;fill:none;stroke-width:1.7}
+main{padding:26px 30px 60px;max-width:1500px;overflow:hidden}
+header.page{display:flex;justify-content:space-between;align-items:flex-start;gap:20px;margin-bottom:22px;flex-wrap:wrap}
+header.page p{margin:5px 0 0;color:var(--muted);font-size:13px;max-width:74ch}
+
+/* pieces */
+.grid{display:grid;gap:14px}
+.stats{grid-template-columns:repeat(auto-fill,minmax(158px,1fr))}
+.stat{background:var(--surface);border:1px solid var(--line);padding:13px 15px}
+.stat .k{color:var(--dim);font-size:10.5px;text-transform:uppercase;letter-spacing:.09em}
+.stat .v{font-family:var(--mono);font-size:21px;font-weight:500;margin-top:5px}
+.panel{background:var(--surface);border:1px solid var(--line);margin-bottom:18px}
+.panel>h2{font-size:13px;text-transform:uppercase;letter-spacing:.08em;color:var(--muted);padding:13px 16px;border-bottom:1px solid var(--line)}
+.panel .body{padding:16px}
+.panel .body.flush{padding:0}
+
+button.btn{background:var(--raised);color:var(--text);border:1px solid var(--line-hi);font:500 13px/1 var(--sans);padding:0 16px;height:38px;cursor:pointer;transition:background .18s,border-color .18s,color .18s}
+button.btn:hover:not(:disabled){background:#2b3b52;border-color:#475569}
+button.btn:disabled{opacity:.45;cursor:not-allowed}
+button.btn.primary{background:var(--up);border-color:var(--up);color:#04140a;font-weight:600}
+button.btn.primary:hover:not(:disabled){background:#16a34a;border-color:#16a34a}
+button.btn.ghost{background:none}
+button.btn.danger{color:var(--down);border-color:#7f1d1d}
+button.btn.danger:hover:not(:disabled){background:#450a0a;border-color:var(--down)}
+.row{display:flex;gap:9px;flex-wrap:wrap;align-items:center}
+
+label{display:block;color:var(--muted);font-size:11px;text-transform:uppercase;letter-spacing:.07em;margin-bottom:5px}
+input,select{width:100%;background:#0b1424;border:1px solid var(--line-hi);color:var(--text);font:400 13px/1 var(--mono);padding:0 11px;height:38px}
+input::placeholder{color:var(--dim)}
+.fields{display:grid;grid-template-columns:repeat(auto-fill,minmax(168px,1fr));gap:13px;margin-bottom:15px}
+.fields .wide{grid-column:1/-1}
+
+.tablewrap{overflow-x:auto}
+table{width:100%;border-collapse:collapse;font-size:13px}
+th{text-align:left;color:var(--dim);font-size:10.5px;text-transform:uppercase;letter-spacing:.08em;font-weight:600;padding:9px 13px;border-bottom:1px solid var(--line);white-space:nowrap;background:var(--surface);position:sticky;top:0}
+td{padding:9px 13px;border-bottom:1px solid #131f33;white-space:nowrap}
+tbody tr{transition:background .15s}
+tbody tr.clickable{cursor:pointer}
+tbody tr.clickable:hover{background:#0d1728}
+.num{text-align:right;font-family:var(--mono)}
+.up{color:var(--up)}.down{color:var(--down)}.warn{color:var(--warn)}.muted{color:var(--muted)}.dim{color:var(--dim)}
+.tag{display:inline-block;font:500 10.5px/18px var(--mono);padding:0 7px;border:1px solid var(--line-hi);color:var(--muted)}
+.tag.ok{color:var(--up);border-color:#14532d}
+.tag.bad{color:var(--down);border-color:#7f1d1d}
+.tag.run{color:var(--info);border-color:#075985}
+.tag.warn{color:var(--warn);border-color:#78350f}
+.addr{font-family:var(--mono);font-size:12px;color:var(--muted)}
+.bar{height:3px;background:#132033;overflow:hidden}
+.bar i{display:block;height:100%;background:var(--up)}
+
+pre.log{background:#020617;border:1px solid var(--line);color:#cbd5e1;font:400 12px/1.65 var(--mono);padding:13px;max-height:340px;overflow:auto;margin:0;white-space:pre-wrap;word-break:break-word}
+.empty{color:var(--dim);font-size:13px;padding:26px 16px;text-align:center}
+.note{border-left:2px solid var(--warn);background:#1a1206;color:#fcd9a4;font-size:12.5px;padding:11px 14px;margin-bottom:18px}
+.note.info{border-color:var(--info);background:#061a26;color:#bae6fd}
+.spin{display:inline-block;width:11px;height:11px;border:2px solid var(--line-hi);border-top-color:var(--info);animation:sp .8s linear infinite;vertical-align:-1px}
+@keyframes sp{to{transform:rotate(360deg)}}
+.hide{display:none!important}
+@media (prefers-reduced-motion:reduce){*{animation:none!important;transition:none!important}}
+@media (max-width:900px){.shell{grid-template-columns:1fr}nav{position:static;height:auto;display:flex;overflow-x:auto;padding:0}.brand{display:none}nav button{border-left:0;border-bottom:2px solid transparent;white-space:nowrap}nav button[aria-current="true"]{border-left:0;border-bottom-color:var(--up)}main{padding:18px 14px 50px}}
+</style>
+</head>
+<body>
+<div class="shell">
+<nav aria-label="Sections">
+  <div class="brand"><b>polywatch</b><span id="brandMode">paper mode</span></div>
+  <button data-view="overview" aria-current="true"><svg viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="9"/><rect x="14" y="3" width="7" height="5"/><rect x="14" y="12" width="7" height="9"/><rect x="3" y="16" width="7" height="5"/></svg>Overview</button>
+  <button data-view="follow"><svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14"/></svg>New Task</button>
+  <button data-view="traders"><svg viewBox="0 0 24 24"><path d="M3 17l6-6 4 4 8-8"/><path d="M14 7h7v7"/></svg>Traders</button>
+  <button data-view="tasks"><svg viewBox="0 0 24 24"><path d="M4 6h16M4 12h16M4 18h10"/></svg>Tasks</button>
+  <button data-view="runs"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="9"/><path d="M12 7v5l3 2"/></svg>Runs</button>
+  <button data-view="discover"><svg viewBox="0 0 24 24"><circle cx="11" cy="11" r="7"/><path d="M21 21l-4.3-4.3"/></svg>Discover</button>
+  <button data-view="jobs"><svg viewBox="0 0 24 24"><path d="M4 4h16v6H4zM4 14h16v6H4z"/></svg>Activity</button>
+</nav>
+<main id="main"></main>
+</div>
+
+<script>
+const $ = (s,r=document)=>r.querySelector(s);
+const api = {
+  get: (p,q={}) => fetch(p+'?'+new URLSearchParams(q)).then(r=>r.json()),
+  post: (p,b={}) => fetch(p,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(b)}).then(r=>r.json()),
+};
+const S = {view:'overview', poll:null, runId:null, watching:new Set()};
+
+const usd = n => (n==null||isNaN(n)) ? '—' : '$'+Number(n).toLocaleString(undefined,{minimumFractionDigits:2,maximumFractionDigits:2});
+const pct = n => (n==null||isNaN(n)) ? '—' : (Number(n)*100).toFixed(1)+'%';
+const num = n => (n==null||isNaN(n)) ? '—' : Number(n).toLocaleString();
+const ago = ts => { if(!ts) return '—'; const s=Date.now()/1000-ts;
+  if(s<90) return Math.max(0,Math.round(s))+'s ago'; if(s<5400) return Math.round(s/60)+'m ago';
+  if(s<172800) return Math.round(s/3600)+'h ago'; return Math.round(s/86400)+'d ago'; };
+const day = ts => ts ? new Date(ts*1000).toISOString().slice(0,10) : '—';
+const esc = s => String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+const short = a => a ? a.slice(0,10)+'…'+a.slice(-4) : '—';
+const pnlClass = (v,base) => v==null?'':(v>base?'up':v<base?'down':'');
+
+function nav(view){
+  S.view = view;
+  document.querySelectorAll('nav button').forEach(b=>b.setAttribute('aria-current', String(b.dataset.view===view)));
+  if(S.poll){clearInterval(S.poll); S.poll=null;}
+  render();
+}
+document.querySelectorAll('nav button').forEach(b=>b.onclick=()=>nav(b.dataset.view));
+
+async function render(){
+  const m = $('#main');
+  if(S.view==='overview') return viewOverview(m);
+  if(S.view==='follow') return viewFollow(m);
+  if(S.view==='traders') return viewTraders(m);
+  if(S.view==='tasks') return viewTasks(m);
+  if(S.view==='runs') return S.runId ? viewRunDetail(m) : viewRuns(m);
+  if(S.view==='discover') return viewDiscover(m);
+  if(S.view==='jobs') return viewJobs(m);
+}
+
+function head(title, sub, actions=''){
+  return `<header class="page"><div><h1>${title}</h1><p>${sub}</p></div><div class="row">${actions}</div></header>`;
+}
+
+/* ---------- overview ---------- */
+async function viewOverview(m){
+  m.innerHTML = head('Overview','What the bot currently knows, and what it has done with it.')
+    + `<div id="ov"><div class="empty"><span class="spin"></span> loading</div></div>`;
+  const d = await api.get('/api/overview');
+  const o = d.overview;
+  const stale = d.server_time - o.newest_trade_ts;
+  $('#ov').innerHTML = `
+  <div class="grid stats" style="margin-bottom:18px">
+    ${stat('Wallets known', num(o.wallets))}
+    ${stat('Passed screen', num(o.screened))}
+    ${stat('Ranked', num(o.scored))}
+    ${stat('Trades stored', num(o.trades))}
+    ${stat('Markets', num(o.markets))}
+    ${stat('Tasks', num(o.tasks))}
+    ${stat('Runs', num(o.runs))}
+    ${stat('Data age', stale>3*86400?`<span class="warn">${ago(o.newest_trade_ts)}</span>`:ago(o.newest_trade_ts))}
+  </div>
+  <div class="note">Paper mode only. Nothing in this console can place a real order — the live execution path is not built, and the HTTP client is GET-only with no signing.</div>
+  <div class="panel"><h2>Recent runs</h2><div class="body flush">${runsTable(d.runs)}</div></div>
+  <div class="panel"><h2>Activity</h2><div class="body flush">${jobsTable(d.jobs)}</div></div>`;
+  wireRunRows();
+}
+const stat = (k,v)=>`<div class="stat"><div class="k">${k}</div><div class="v">${v}</div></div>`;
+
+/* ---------- new task / follow ---------- */
+function viewFollow(m){
+  m.innerHTML = head('New copy-trade task',
+    'Paste any Polymarket wallet address. It is fetched, backtested at 0% / 3% / 7% slippage over the chosen window, and saved as a task.')
+  + `<div class="panel"><h2>Target</h2><div class="body">
+      <div class="fields">
+        <div class="wide"><label for="f_addr">Wallet address</label>
+          <input id="f_addr" placeholder="0x…40 hex characters" autocomplete="off" spellcheck="false"></div>
+        <div><label for="f_name">Task name</label><input id="f_name" placeholder="auto"></div>
+        <div><label for="f_bank">Bankroll (USD)</label><input id="f_bank" type="number" value="100" min="1" step="10"></div>
+        <div><label for="f_stake">Stake per trade</label><input id="f_stake" type="number" placeholder="2% of bankroll" step="1"></div>
+        <div><label for="f_conc">Max concurrent</label><input id="f_conc" type="number" value="5" min="1" step="1"></div>
+        <div><label for="f_days">History (days)</label><input id="f_days" type="number" value="60" min="7" step="1"></div>
+        <div><label for="f_behav">Behaviour</label><select id="f_behav">
+          <option value="buys_sells">Copy buys and sells</option><option value="buys">Copy buys only</option></select></div>
+        <div><label for="f_style">Style band</label><select id="f_style">
+          <option value="momentum">Momentum (0.02–0.98)</option>
+          <option value="safe_and_steady">Safe &amp; steady (0.60–0.97)</option>
+          <option value="value_hunter">Value hunter (0.03–0.40)</option></select></div>
+        <div><label for="f_risk">Risk</label><select id="f_risk">
+          <option value="moderate">Moderate (0.01–0.99)</option>
+          <option value="conservative">Conservative (0.10–0.92)</option></select></div>
+      </div>
+      <div class="row">
+        <button class="btn primary" id="f_go">Fetch, backtest &amp; save</button>
+        <button class="btn" id="f_bt">Backtest only</button>
+        <label style="display:flex;align-items:center;gap:7px;text-transform:none;letter-spacing:0;font-size:12.5px;margin:0;color:var(--muted)">
+          <input type="checkbox" id="f_fetch" checked style="width:auto;height:auto"> fetch fresh data
+        </label>
+      </div>
+      <div id="f_err" class="note hide" style="margin-top:14px"></div>
+    </div></div>
+    <div id="f_out"></div>`;
+
+  const read = () => ({
+    trader: $('#f_addr').value.trim(), name: $('#f_name').value.trim() || undefined,
+    bankroll: +$('#f_bank').value || 100, fixed_usd: +$('#f_stake').value || undefined,
+    max_concurrent: +$('#f_conc').value || 5, days: +$('#f_days').value || 60,
+    behavior: $('#f_behav').value, style: $('#f_style').value, risk: $('#f_risk').value,
+    fetch: $('#f_fetch').checked,
+  });
+  const start = async (path) => {
+    const b = read();
+    if(!/^0x[0-9a-fA-F]{40}$/.test(b.trader)){
+      const e=$('#f_err'); e.classList.remove('hide');
+      e.textContent='That is not a Polymarket wallet address — expected 0x followed by 40 hex characters.'; return;
+    }
+    $('#f_err').classList.add('hide');
+    $('#f_go').disabled = $('#f_bt').disabled = true;
+    const r = await api.post(path, b);
+    $('#f_go').disabled = $('#f_bt').disabled = false;
+    if(r.error){ const e=$('#f_err'); e.classList.remove('hide'); e.textContent=r.error; return; }
+    watchJob(r.job.id, '#f_out');
+  };
+  $('#f_go').onclick = ()=>start('/api/follow');
+  $('#f_bt').onclick = ()=>start('/api/backtest');
+  $('#f_addr').focus();
+}
+
+/* ---------- job watching ---------- */
+async function watchJob(id, mount){
+  const el = $(mount); if(!el) return;
+  if(S.poll){clearInterval(S.poll); S.poll=null;}
+  const tick = async () => {
+    const j = await api.get('/api/job',{id});
+    el.innerHTML = jobPanel(j);
+    if(j.status==='done'||j.status==='failed'){
+      clearInterval(S.poll); S.poll=null;
+      if(j.result && j.result.results) el.innerHTML += resultPanel(j.result);
+      if(j.result && j.result.finalists) el.innerHTML += finalistsPanel(j.result);
+    }
+  };
+  await tick();
+  S.poll = setInterval(tick, 1500);
+}
+function jobPanel(j){
+  const badge = j.status==='running' ? `<span class="tag run"><span class="spin"></span> running</span>`
+    : j.status==='done' ? `<span class="tag ok">done</span>`
+    : j.status==='failed' ? `<span class="tag bad">failed</span>` : `<span class="tag">queued</span>`;
+  return `<div class="panel"><h2>${esc(j.label)} ${badge} <span class="dim mono" style="float:right;text-transform:none">${j.elapsed}s</span></h2>
+    <div class="body"><pre class="log" id="joblog">${esc((j.lines||[]).join('\n'))||'…'}</pre></div></div>`;
+}
+function resultPanel(r){
+  const rows = Object.entries(r.results).map(([slip,v])=>{
+    const cls = pnlClass(v.final, 100);
+    return `<tr class="clickable" data-run="${v.run_id}"><td class="num">${(+slip*100).toFixed(0)}%</td>
+      <td class="num ${cls}">${usd(v.final)}</td><td class="num">${num(v.copied)}</td>
+      <td class="num">${num(v.closed)}</td><td class="num">${v.closed?pct(v.wins/v.closed):'—'}</td>
+      <td class="num">${usd(v.fees)}</td><td class="num">${num(v.skipped)}</td></tr>`;
+  }).join('');
+  const any = Object.values(r.results);
+  const worst = any[any.length-1];
+  const warn = worst && worst.final <= 100
+    ? `<div class="note">At the pessimistic slippage this trader does not make money. Slippage is an assumption, not a measurement — the spread across these rows is how much of the result rests on it.</div>`
+    : `<div class="note info">Slippage is an assumption, not a measurement. The spread across these rows is how much of the result rests on it.</div>`;
+  return `<div class="panel"><h2>Backtest — ${esc(short(r.address))}${r.task?` · saved as ${esc(r.task)}`:''}</h2>
+    <div class="body">${warn}<div class="tablewrap"><table>
+    <thead><tr><th class="num">Slippage</th><th class="num">Final</th><th class="num">Copied</th>
+    <th class="num">Closed</th><th class="num">Profitable</th><th class="num">Fees</th><th class="num">Skipped</th></tr></thead>
+    <tbody>${rows}</tbody></table></div>
+    <p class="dim" style="font-size:12px;margin:12px 0 0">Click a row to inspect that run's signals, orders and positions.</p>
+    </div></div>`;
+}
+
+/* ---------- traders ---------- */
+async function viewTraders(m){
+  m.innerHTML = head('Ranked traders',
+    'Scored on settled positions before the walk-forward cutoff. Calibration is weighted heaviest — a Brier at or above 0.25 is no better than guessing 50/50 and scores zero.')
+    + `<div id="tr"><div class="empty"><span class="spin"></span> loading</div></div>`;
+  const d = await api.get('/api/traders',{limit:100});
+  if(!d.traders.length){
+    $('#tr').innerHTML = `<div class="panel"><div class="empty">No ranked traders yet. Run a leaderboard sweep from <b>Discover</b>.</div></div>`; return;
+  }
+  const rows = d.traders.map(t=>{
+    const bad = t.brier==null || t.brier>=0.25;
+    return `<tr class="clickable" data-addr="${esc(t.address)}">
+      <td>${esc(t.username||'—')}<div class="addr">${short(t.address)}</div></td>
+      <td class="num">${t.rank_score!=null?t.rank_score.toFixed(3):'—'}</td>
+      <td class="num ${bad?'down':'up'}">${t.brier!=null?t.brier.toFixed(3):'n/a'}</td>
+      <td class="num ${t.roi>0?'up':'down'}">${pct(t.roi)}</td>
+      <td class="num">${pct(t.consistency)}</td>
+      <td class="num">${pct(t.max_drawdown)}</td>
+      <td class="num">${num(t.n_closed)}</td>
+      <td class="num">${usd(t.est_account_usd)}</td>
+      <td>${bad?'<span class="tag bad">coin-flip</span>':'<span class="tag ok">calibrated</span>'}</td></tr>`;
+  }).join('');
+  $('#tr').innerHTML = `<div class="panel"><div class="body flush"><div class="tablewrap"><table>
+    <thead><tr><th>Trader</th><th class="num">Rank</th><th class="num">Brier</th><th class="num">ROI</th>
+    <th class="num">Consistency</th><th class="num">Drawdown</th><th class="num">Settled</th>
+    <th class="num">Est. account</th><th>Calibration</th></tr></thead><tbody>${rows}</tbody></table></div></div></div>`;
+  document.querySelectorAll('#tr tr.clickable').forEach(tr=>tr.onclick=()=>{
+    nav('follow'); setTimeout(()=>{ $('#f_addr').value = tr.dataset.addr; $('#f_addr').focus(); },40);
+  });
+}
+
+/* ---------- tasks ---------- */
+async function viewTasks(m){
+  m.innerHTML = head('Tasks','Saved copy-trade configurations. Each is registered at the pessimistic slippage.',
+    `<button class="btn primary" onclick="nav('follow')">New task</button>`)
+    + `<div id="tk"><div class="empty"><span class="spin"></span> loading</div></div>`;
+  const d = await api.get('/api/tasks');
+  if(!d.tasks.length){
+    $('#tk').innerHTML = `<div class="panel"><div class="empty">No tasks yet. Create one from <b>New Task</b>.</div></div>`; return;
+  }
+  const rows = d.tasks.map(t=>`<tr>
+    <td>${esc(t.name)}<div class="addr">${short(t.trader)}</div></td>
+    <td><span class="tag ${t.mode==='live'?'bad':''}">${esc(t.mode)}</span></td>
+    <td class="num">${usd(t.bankroll)}</td>
+    <td class="num">${t.buy_method==='fixed'?usd(t.fixed_usd):'mirror'}</td>
+    <td class="num">${t.max_concurrent}</td>
+    <td class="num">${pct(t.slippage)}</td>
+    <td>${esc(t.behavior)}</td>
+    <td class="num">${num(t.run_count)}</td>
+    <td class="num ${pnlClass(t.last_end_bankroll,t.bankroll)}">${t.last_end_bankroll!=null?usd(t.last_end_bankroll):'—'}</td>
+    <td><div class="row">
+      <button class="btn ghost" data-bt="${esc(t.trader)}">Backtest</button>
+      <button class="btn danger" data-del="${esc(t.name)}">Delete</button></div></td></tr>`).join('');
+  $('#tk').innerHTML = `<div class="panel"><div class="body flush"><div class="tablewrap"><table>
+    <thead><tr><th>Task</th><th>Mode</th><th class="num">Bankroll</th><th class="num">Stake</th>
+    <th class="num">Slots</th><th class="num">Slippage</th><th>Behaviour</th><th class="num">Runs</th>
+    <th class="num">Last result</th><th></th></tr></thead><tbody>${rows}</tbody></table></div></div></div>
+    <div id="tk_out"></div>`;
+  document.querySelectorAll('[data-del]').forEach(b=>b.onclick=async()=>{
+    if(!confirm(`Delete task "${b.dataset.del}"? Its past runs and positions stay in the database.`)) return;
+    await api.post('/api/task/delete',{name:b.dataset.del}); render();
+  });
+  document.querySelectorAll('[data-bt]').forEach(b=>b.onclick=async()=>{
+    b.disabled=true; const r = await api.post('/api/backtest',{trader:b.dataset.bt}); b.disabled=false;
+    if(r.job) watchJob(r.job.id,'#tk_out');
+  });
+}
+
+/* ---------- runs ---------- */
+function runsTable(runs){
+  if(!runs || !runs.length) return `<div class="empty">No runs yet.</div>`;
+  const rows = runs.map(r=>`<tr class="clickable" data-run="${r.id}">
+    <td class="num">${r.id}</td><td>${esc(r.task||'—')}<div class="addr">${short(r.trader)}</div></td>
+    <td class="num">${pct(r.slippage)}</td>
+    <td class="num">${usd(r.start_bankroll)}</td>
+    <td class="num ${pnlClass(r.end_bankroll,r.start_bankroll)}">${r.end_bankroll!=null?usd(r.end_bankroll):'<span class="tag run">open</span>'}</td>
+    <td class="num">${num(r.copied)}/${num(r.signals)}</td>
+    <td class="num">${num(r.closed)}</td>
+    <td class="dim">${day(r.started_at)} → ${day(r.stopped_at)}</td></tr>`).join('');
+  return `<div class="tablewrap"><table><thead><tr><th class="num">#</th><th>Task</th>
+    <th class="num">Slip</th><th class="num">Start</th><th class="num">End</th>
+    <th class="num">Copied</th><th class="num">Closed</th><th>Window</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+function wireRunRows(){
+  document.querySelectorAll('[data-run]').forEach(el=>el.onclick=()=>{
+    S.runId = +el.dataset.run; nav('runs');
+  });
+}
+async function viewRuns(m){
+  m.innerHTML = head('Runs','Every backtest and paper run, newest first. Open one to audit what it did.')
+    + `<div id="rs"><div class="empty"><span class="spin"></span> loading</div></div>`;
+  const d = await api.get('/api/runs',{limit:100});
+  $('#rs').innerHTML = `<div class="panel"><div class="body flush">${runsTable(d.runs)}</div></div>`;
+  wireRunRows();
+}
+async function viewRunDetail(m){
+  m.innerHTML = head('Run '+S.runId,'What the target did, what we copied, and why we passed on the rest.',
+    `<button class="btn" id="back">← All runs</button>`)
+    + `<div id="rd"><div class="empty"><span class="spin"></span> loading</div></div>`;
+  $('#back').onclick = ()=>{ S.runId=null; render(); };
+  const d = await api.get('/api/run',{id:S.runId, limit:300});
+  if(!d.run){ $('#rd').innerHTML = `<div class="panel"><div class="empty">No such run.</div></div>`; return; }
+  const s = d.summary, r = d.run;
+  const skips = d.skips.length ? d.skips.map(k=>{
+    const top = d.skips[0].count || 1;
+    return `<tr><td>${esc(k.reason)}</td><td class="num">${num(k.count)}</td>
+      <td style="width:180px"><div class="bar"><i style="width:${(k.count/top*100).toFixed(1)}%"></i></div></td></tr>`;
+  }).join('') : `<tr><td colspan="3" class="dim">Nothing was skipped.</td></tr>`;
+
+  const pos = d.positions.length ? d.positions.map(p=>`<tr>
+    <td style="max-width:340px;overflow:hidden;text-overflow:ellipsis">${esc(p.question||p.condition_id.slice(0,18))}</td>
+    <td class="num">${Number(p.shares).toFixed(1)}</td>
+    <td class="num">${Number(p.avg_price).toFixed(3)}</td>
+    <td class="num">${usd(p.cost_usd)}</td>
+    <td class="num">${usd(p.fees_paid)}</td>
+    <td class="num ${p.realized_pnl>0?'up':p.realized_pnl<0?'down':''}">${p.realized_pnl!=null?usd(p.realized_pnl):'—'}</td>
+    <td>${p.open?'<span class="tag run">open</span>':`<span class="tag ${p.realized_pnl>0?'ok':'bad'}">${esc(p.close_reason||'closed')}</span>`}</td>
+    <td class="dim">${day(p.opened_ts)}</td></tr>`).join('')
+    : `<tr><td colspan="8" class="dim">No positions.</td></tr>`;
+
+  const sig = d.signals.length ? d.signals.slice(0,150).map(x=>`<tr>
+    <td class="dim">${day(x.trader_ts)}</td>
+    <td>${esc(x.side||x.kind)}</td>
+    <td class="num">${Number(x.size||0).toFixed(1)}</td>
+    <td class="num">${x.price!=null?Number(x.price).toFixed(3):'—'}</td>
+    <td class="num">${usd(x.usdc_size)}</td>
+    <td>${x.action==='copied'?'<span class="tag ok">copied</span>':`<span class="tag">${esc(x.reason||'skipped')}</span>`}</td></tr>`).join('')
+    : `<tr><td colspan="6" class="dim">No signals.</td></tr>`;
+
+  $('#rd').innerHTML = `
+  <div class="grid stats" style="margin-bottom:18px">
+    ${stat('Start', usd(r.start_bankroll))}
+    ${stat('End', `<span class="${pnlClass(r.end_bankroll,r.start_bankroll)}">${r.end_bankroll!=null?usd(r.end_bankroll):'open'}</span>`)}
+    ${stat('Realized PnL', `<span class="${s.realized_pnl>0?'up':s.realized_pnl<0?'down':''}">${usd(s.realized_pnl)}</span>`)}
+    ${stat('Fees paid', usd(s.fees_paid))}
+    ${stat('Signals seen', num(s.signals_seen))}
+    ${stat('Copied', num(s.copied))}
+    ${stat('Closed', num(s.positions_closed))}
+    ${stat('Slippage', pct(r.slippage))}
+  </div>
+  <div class="panel"><h2>Why trades were skipped</h2><div class="body flush"><div class="tablewrap">
+    <table><thead><tr><th>Reason</th><th class="num">Count</th><th></th></tr></thead><tbody>${skips}</tbody></table></div></div></div>
+  <div class="panel"><h2>Positions</h2><div class="body flush"><div class="tablewrap"><table>
+    <thead><tr><th>Market</th><th class="num">Shares</th><th class="num">Entry</th><th class="num">Cost</th>
+    <th class="num">Fees</th><th class="num">PnL</th><th>State</th><th>Opened</th></tr></thead>
+    <tbody>${pos}</tbody></table></div></div></div>
+  <div class="panel"><h2>Signals from the target</h2><div class="body flush"><div class="tablewrap"><table>
+    <thead><tr><th>When</th><th>Side</th><th class="num">Size</th><th class="num">Price</th>
+    <th class="num">Their stake</th><th>Action</th></tr></thead><tbody>${sig}</tbody></table></div></div></div>`;
+}
+
+/* ---------- discover ---------- */
+function viewDiscover(m){
+  m.innerHTML = head('Discover',
+    'Sweeps 11 categories × 4 windows × 2 orderings, screens for humans still trading, ranks on history before a cutoff, then validates the shortlist on days the ranking never saw.')
+  + `<div class="panel"><h2>Walk-forward sweep</h2><div class="body">
+      <div class="note info">Ranking a wallet on the same history you judge it by is curve-fitting. This scores candidates up to a cutoff, then replays the days after it — so the result measures whether the selection rule picks winners <em>in advance</em>.</div>
+      <div class="fields">
+        <div><label for="d_fin">Finalists to validate</label><input id="d_fin" type="number" value="10" min="1" max="30"></div>
+        <div><label for="d_bank">Bankroll (USD)</label><input id="d_bank" type="number" value="100" min="1" step="10"></div>
+        <div><label for="d_reuse">Leaderboard</label><select id="d_reuse">
+          <option value="0">Sweep fresh (slow, ~8 min extra)</option>
+          <option value="1">Reuse stored scan (fast)</option></select></div>
+      </div>
+      <div class="row"><button class="btn primary" id="d_go">Run sweep</button></div>
+      <p class="dim" style="font-size:12px;margin:12px 0 0">Takes 20–40 minutes. It stays running if you navigate away — check <b>Activity</b>.</p>
+    </div></div><div id="d_out"></div>`;
+  $('#d_go').onclick = async ()=>{
+    $('#d_go').disabled = true;
+    const r = await api.post('/api/recommend',{finalists:+$('#d_fin').value||10,
+      bankroll:+$('#d_bank').value||100, reuse_scan:$('#d_reuse').value==='1'});
+    $('#d_go').disabled = false;
+    if(r.job) watchJob(r.job.id,'#d_out');
+  };
+}
+function finalistsPanel(res){
+  const f = res.finalists||[];
+  if(!f.length) return `<div class="panel"><div class="empty">No candidate cleared every stage — the honest outcome when the evidence is not there.</div></div>`;
+  const slips = Object.keys(f[0].out_of_sample||{});
+  const rows = f.map((x,i)=>`<tr class="clickable" data-addr="${esc(x.address)}">
+    <td class="num">${i+1}</td>
+    <td>${esc(x.username||'—')}<div class="addr">${short(x.address)}</div></td>
+    <td class="num">${x.rank_score!=null?x.rank_score.toFixed(3):'—'}</td>
+    <td class="num ${(x.brier==null||x.brier>=0.25)?'down':'up'}">${x.brier!=null?x.brier.toFixed(3):'n/a'}</td>
+    <td class="num">${pct(x.roi)}</td>
+    ${slips.map(s=>`<td class="num ${pnlClass(x.out_of_sample[s],100)}">${usd(x.out_of_sample[s])}</td>`).join('')}
+    <td class="num">${num(x.closed)}</td>
+    <td>${x.disqualifiers.length?`<span class="tag warn">${x.disqualifiers.length} warning${x.disqualifiers.length>1?'s':''}</span>`:'<span class="tag ok">clean</span>'}</td></tr>`).join('');
+  const best = f[0];
+  return `<div class="panel"><h2>Finalists — validated on unseen days</h2><div class="body flush">
+    <div class="tablewrap"><table><thead><tr><th class="num">#</th><th>Trader</th><th class="num">Rank</th>
+    <th class="num">Brier</th><th class="num">ROI</th>
+    ${slips.map(s=>`<th class="num">${(+s*100).toFixed(0)}% slip</th>`).join('')}
+    <th class="num">Closed</th><th>Flags</th></tr></thead><tbody>${rows}</tbody></table></div></div>
+    <div class="body">
+      <h3 style="font-size:14px;margin-bottom:6px">Recommendation — ${esc(best.username||short(best.address))}</h3>
+      <div class="addr" style="margin-bottom:10px">${esc(best.address)}</div>
+      ${best.disqualifiers.length?`<div class="note"><b>Warnings:</b><br>${best.disqualifiers.map(esc).join('<br>')}</div>`:''}
+      ${best.closed<10?`<div class="note">Only ${best.closed} positions settled in the validation window — too small a sample to separate skill from luck.</div>`:''}
+      <button class="btn primary" onclick="nav('follow');setTimeout(()=>{document.querySelector('#f_addr').value='${esc(best.address)}';},40)">Create task for this trader</button>
+    </div></div>`;
+}
+
+/* ---------- jobs ---------- */
+function jobsTable(jobs){
+  if(!jobs || !jobs.length) return `<div class="empty">Nothing has run yet.</div>`;
+  const rows = jobs.map(j=>{
+    const badge = j.status==='running'?`<span class="tag run"><span class="spin"></span> running</span>`
+      :j.status==='done'?`<span class="tag ok">done</span>`
+      :j.status==='failed'?`<span class="tag bad">failed</span>`:`<span class="tag">queued</span>`;
+    return `<tr class="clickable" data-job="${j.id}"><td class="mono dim">${j.id}</td>
+      <td>${esc(j.label)}</td><td>${badge}</td><td class="num">${j.elapsed}s</td>
+      <td class="dim mono" style="max-width:420px;overflow:hidden;text-overflow:ellipsis">${esc((j.lines||[]).slice(-1)[0]||'')}</td></tr>`;
+  }).join('');
+  return `<div class="tablewrap"><table><thead><tr><th>ID</th><th>Job</th><th>Status</th>
+    <th class="num">Elapsed</th><th>Last line</th></tr></thead><tbody>${rows}</tbody></table></div>`;
+}
+async function viewJobs(m){
+  m.innerHTML = head('Activity','Everything the console has started. Jobs keep running when you navigate away.')
+    + `<div id="jb"><div class="empty"><span class="spin"></span> loading</div></div><div id="jb_out"></div>`;
+  const paint = async () => {
+    const d = await api.get('/api/jobs');
+    $('#jb').innerHTML = `<div class="panel"><div class="body flush">${jobsTable(d.jobs)}</div></div>`;
+    document.querySelectorAll('[data-job]').forEach(el=>el.onclick=()=>{
+      if(S.poll){clearInterval(S.poll);S.poll=null;} watchJob(el.dataset.job,'#jb_out');
+    });
+  };
+  await paint();
+  S.poll = setInterval(paint, 4000);
+}
+
+render();
+</script>
+</body>
+</html>

@@ -247,14 +247,21 @@ def ingest_trades(con: sqlite3.Connection, client: Client, wallets: list[str], s
 
 
 def ingest_markets(con: sqlite3.Connection, client: Client, stats: Stats,
-                   refresh_open: bool = True, workers: int = 4) -> None:
+                   refresh_open: bool = True, workers: int = 4,
+                   wallets: list[str] | None = None) -> None:
     """Market metadata for every condition id seen in trades.
 
     Gamma hides closed markets unless closed=true is passed, so each batch is swept twice: once
     for settled markets, once for live ones. Unresolved markets are re-fetched on later runs
     because a market that was open last week may have resolved since.
+
+    `wallets` narrows the work to those wallets' markets. Walk-forward validation needs the
+    metadata for one candidate at a time, and without this it would fetch every market touched
+    by every screened wallet -- on a real sweep that is over a hundred thousand markets to
+    backtest a wallet that traded a few hundred.
     """
-    wanted = store.condition_ids_in_trades(con, selected_only=True)
+    wanted = (store.condition_ids_for_wallets(con, wallets) if wallets
+              else store.condition_ids_in_trades(con, selected_only=True))
     known = store.known_condition_ids(con)
     todo = sorted(wanted - known)
     if refresh_open:

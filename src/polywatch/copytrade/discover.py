@@ -51,11 +51,60 @@ TRADE_PAGES_FOR_SCORING = 4
 MAX_CLOSED_PAGES = 20
 
 
-def fetch_closed(client: Client, address: str, max_pages: int = MAX_CLOSED_PAGES) -> list[dict]:
+def sweep_leaderboard(con, client: Client, pages: int = SWEEP_PAGES_PER_COMBO,
+                     categories=LEADERBOARD_CATEGORIES, periods=LEADERBOARD_PERIODS,
+                     orderings=LEADERBOARD_ORDERINGS, on_progress=None) -> list[str]:
+    """Stage 1: assemble the candidate pool from every corner of the leaderboard.
+
+    The default OVERALL / ALL / PNL call that `ingest.ingest_wallets` makes returns the same
+    handful of whales every time -- wallets whose rank is a function of bankroll rather than
+    ability, and whose size makes them uncopyable at $100. Sweeping the other combinations is
+    the only way to reach the smaller, still-active wallets that are worth following.
+
+    The DAY and WEEK periods matter most here: they are what surface a wallet that is trading
+    well *now*, as opposed to one coasting on a record set in March.
+
+    Deduped by address, so a wallet appearing in six categories costs one row. The rank and
+    volume kept are whichever the last combination reported -- neither is used for ranking
+    (see the module docstring), only for the screen's volume cap.
+    """
+    seen: dict[str, dict] = {}
+    combos = [(c, p, o) for c in categories for p in periods for o in orderings]
+    for i, (category, period, ordering) in enumerate(combos, 1):
+        for page in range(pages):
+            try:
+                payload = api.leaderboard(client, offset=page * LEADERBOARD_PAGE,
+                                          limit=LEADERBOARD_PAGE, category=category,
+                                          time_period=period, order_by=ordering)
+            except FetchError:
+                # One dead combination must not abort a sweep of eighty-eight of them.
+                break
+            rows = records.parse_leaderboard(payload)
+            for row in rows:
+                seen.setdefault(row["address"], row)
+            if len(rows) < LEADERBOARD_PAGE:
+                break
+        if on_progress:
+            on_progress(i, len(combos), len(seen))
+
+    store.upsert_wallets(con, list(seen.values()))
+    return list(seen)
+
+
+def fetch_closed(client: Client, address: str, max_pages: int = MAX_CLOSED_PAGES,
+                 until_ts: int | None = None, enough: int | None = None) -> list[dict]:
     """Every settled position for a wallet, paged out.
 
     The endpoint caps at 50 rows per page whatever `limit` says, so a short page means the end
     of the history rather than an error.
+
+    `until_ts` and `enough` together stop the paging early, and the pair exists because of a
+    trap in how this endpoint orders its results. Rows come back newest first, so for a wallet
+    that trades daily the first several pages sit entirely inside the recent window that
+    walk-forward ranking is required to ignore. Filter those out and a flat page cap leaves the
+    most active wallets -- exactly the ones worth copying -- scored on a handful of positions or
+    none at all. Paging therefore continues until `enough` positions older than `until_ts` are
+    in hand, and only then stops.
     """
     out: list[dict] = []
     for page in range(max_pages):
@@ -64,6 +113,10 @@ def fetch_closed(client: Client, address: str, max_pages: int = MAX_CLOSED_PAGES
         out.extend(rows)
         if len(rows) < CLOSED_POSITIONS_PAGE:
             break
+        if until_ts is not None and enough:
+            have = sum(1 for p in out if p.get("end_ts") and p["end_ts"] <= until_ts)
+            if have >= enough:
+                break
     return out
 
 
