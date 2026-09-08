@@ -46,6 +46,19 @@ def init_db(con: sqlite3.Connection) -> None:
                       ("accepting_orders", "INTEGER"), ("enable_order_book", "INTEGER")):
         if col not in have:
             con.execute(f"ALTER TABLE markets ADD COLUMN {col} {decl}")
+    # ...and for databases written before a partially-sold position had anywhere to put the fees
+    # it had already expensed. Defaulting to 0 is right for old rows: nothing before this column
+    # existed could record a partial exit in the first place.
+    have = {r["name"] for r in con.execute("PRAGMA table_info(positions)")}
+    for col, decl in (("fees_realized", "REAL NOT NULL DEFAULT 0"),):
+        if col not in have:
+            con.execute(f"ALTER TABLE positions ADD COLUMN {col} {decl}")
+    # ...and before an order kept a thread back to the exchange, which is what reconciliation
+    # pulls on when a response did not say what the order matched.
+    have = {r["name"] for r in con.execute("PRAGMA table_info(orders)")}
+    for col, decl in (("exchange_id", "TEXT"),):
+        if col not in have:
+            con.execute(f"ALTER TABLE orders ADD COLUMN {col} {decl}")
     con.commit()
 
 
@@ -390,12 +403,14 @@ def skip_reasons(con: sqlite3.Connection, run_id: int) -> list[tuple[str, int]]:
 
 def insert_order(con: sqlite3.Connection, row: dict) -> int:
     row.setdefault("ts", int(time.time()))
+    row.setdefault("exchange_id", None)
     cur = con.execute(
         """INSERT INTO orders
                (run_id, signal_id, mode, token_id, condition_id, side, intent_usd, limit_price,
-                book_vwap, filled_shares, avg_price, fee, status, reason, ts)
+                book_vwap, filled_shares, avg_price, fee, status, exchange_id, reason, ts)
            VALUES (:run_id,:signal_id,:mode,:token_id,:condition_id,:side,:intent_usd,
-                :limit_price,:book_vwap,:filled_shares,:avg_price,:fee,:status,:reason,:ts)""",
+                :limit_price,:book_vwap,:filled_shares,:avg_price,:fee,:status,:exchange_id,
+                :reason,:ts)""",
         row,
     )
     con.commit()
@@ -405,6 +420,35 @@ def insert_order(con: sqlite3.Connection, row: dict) -> int:
 def orders(con: sqlite3.Connection, run_id: int) -> list[sqlite3.Row]:
     return con.execute("SELECT * FROM orders WHERE run_id=? ORDER BY ts, id",
                        (run_id,)).fetchall()
+
+
+def unknown_orders(con: sqlite3.Connection, run_id: int) -> list[sqlite3.Row]:
+    """Orders the exchange accepted without saying what they matched.
+
+    Each one of these is a question the database cannot answer on its own, and every one of them
+    must be closed out by reconciliation before the run is allowed to keep trading.
+    """
+    return con.execute(
+        "SELECT * FROM orders WHERE run_id=? AND status='unknown' ORDER BY ts, id",
+        (run_id,)).fetchall()
+
+
+def resolve_order(con: sqlite3.Connection, order_id: int, status: str, shares: float,
+                  avg_price: float | None, fee: float, reason: str) -> None:
+    """Write back what an order turned out to have done, once the exchange has been asked."""
+    con.execute(
+        """UPDATE orders SET status=?, filled_shares=?, avg_price=?, fee=?, reason=?
+           WHERE id=?""",
+        (status, shares, avg_price, fee, reason, order_id))
+    con.commit()
+
+
+def recorded_shares(con: sqlite3.Connection, run_id: int, token_id: str) -> float:
+    """Shares of one token this run believes it is holding."""
+    row = con.execute(
+        """SELECT COALESCE(SUM(shares), 0) FROM positions
+           WHERE run_id=? AND token_id=? AND open=1""", (run_id, token_id)).fetchone()
+    return float(row[0])
 
 
 def open_position(con: sqlite3.Connection, row: dict) -> int:
@@ -440,26 +484,66 @@ def add_to_position(con: sqlite3.Connection, position_id: int, shares: float, co
     con.commit()
 
 
-def close_position(con: sqlite3.Connection, position_id: int, proceeds_usd: float,
-                   exit_fee: float, reason: str) -> float:
-    """Settle a position and return its realized PnL.
+def settle_position(con: sqlite3.Connection, position_id: int, shares_sold: float,
+                    proceeds_usd: float, exit_fee: float, reason: str) -> tuple[float, bool]:
+    """Realize all or part of a position. Returns (pnl of the sold portion, position closed).
 
-    PnL is proceeds minus entry cost minus every fee on both sides. Fees are subtracted here
-    rather than folded into cost_usd so that `report` can show what the taker fee actually
-    cost over a run -- the number this whole exercise exists to measure.
+    Two columns carry fees, and the split is the whole point of this function:
+
+      * `fees_paid` is the entry fee attributable to the shares *still held*. It is what
+        `exits.mark` adds to `cost_usd` to get the cost basis a stop-loss is measured against,
+        and what `run_cash` treats as tied up.
+      * `fees_realized` is everything already expensed against realized PnL -- entry fees on
+        shares that have been sold, plus every exit fee.
+
+    Scaling `fees_paid` down by the sold fraction is not cosmetic. Leaving the whole entry fee on
+    a remainder makes that remainder's cost basis larger than it ever was, so the stop-loss fires
+    against a loss that is partly fictional and `run_cash` reports less money than the run has.
+
+    A partial sale leaves the position open with the remainder, its PnL banked, and the ladder
+    free to try again on the next tick.
     """
-    row = con.execute("SELECT cost_usd, fees_paid FROM positions WHERE id=?",
-                      (position_id,)).fetchone()
+    row = con.execute(
+        "SELECT shares, cost_usd, fees_paid, realized_pnl FROM positions WHERE id=?",
+        (position_id,)).fetchone()
     if row is None:
         raise KeyError(f"no position {position_id}")
-    pnl = proceeds_usd - row["cost_usd"] - row["fees_paid"] - exit_fee
-    con.execute(
-        """UPDATE positions
-           SET open=0, closed_ts=?, close_reason=?, realized_pnl=?, fees_paid=fees_paid+?
-           WHERE id=?""",
-        (int(time.time()), reason, pnl, exit_fee, position_id),
-    )
+    held = row["shares"]
+    if held <= 0:
+        raise ValueError(f"position {position_id} holds no shares")
+
+    closed = shares_sold >= held - 1e-6
+    frac = 1.0 if closed else shares_sold / held
+    part_cost = row["cost_usd"] * frac
+    part_fees = row["fees_paid"] * frac
+    pnl = proceeds_usd - part_cost - part_fees - exit_fee
+    banked = (row["realized_pnl"] or 0.0) + pnl
+
+    if closed:
+        con.execute(
+            """UPDATE positions
+               SET open=0, closed_ts=?, close_reason=?, realized_pnl=?,
+                   cost_usd=0, fees_paid=0, fees_realized=fees_realized+?
+               WHERE id=?""",
+            (int(time.time()), reason, banked, part_fees + exit_fee, position_id))
+    else:
+        con.execute(
+            """UPDATE positions
+               SET shares=shares-?, cost_usd=cost_usd-?, fees_paid=fees_paid-?,
+                   fees_realized=fees_realized+?, realized_pnl=?
+               WHERE id=?""",
+            (shares_sold, part_cost, part_fees, part_fees + exit_fee, banked, position_id))
     con.commit()
+    return pnl, closed
+
+
+def close_position(con: sqlite3.Connection, position_id: int, proceeds_usd: float,
+                   exit_fee: float, reason: str) -> float:
+    """Settle a whole position and return its realized PnL. Thin wrapper over settle_position."""
+    row = con.execute("SELECT shares FROM positions WHERE id=?", (position_id,)).fetchone()
+    if row is None:
+        raise KeyError(f"no position {position_id}")
+    pnl, _ = settle_position(con, position_id, row["shares"], proceeds_usd, exit_fee, reason)
     return pnl
 
 
@@ -473,6 +557,19 @@ def open_position_for(con: sqlite3.Connection, run_id: int, token_id: str) -> sq
     return con.execute(
         "SELECT * FROM positions WHERE run_id=? AND token_id=? AND open=1", (run_id, token_id)
     ).fetchone()
+
+
+def open_position_other_outcome(con: sqlite3.Connection, run_id: int, condition_id: str,
+                                token_id: str) -> sqlite3.Row | None:
+    """An open position on a DIFFERENT outcome of the same market.
+
+    Holding YES and NO of one market pays two entry fees and two exit fees to end up with
+    approximately no exposure, so this is the query behind a gate rather than a report.
+    """
+    return con.execute(
+        """SELECT * FROM positions
+           WHERE run_id=? AND condition_id=? AND token_id<>? AND open=1 LIMIT 1""",
+        (run_id, condition_id, token_id)).fetchone()
 
 
 def market_exposure(con: sqlite3.Connection, run_id: int, condition_id: str) -> float:
@@ -502,9 +599,12 @@ def run_cash(con: sqlite3.Connection, run_id: int) -> float:
     # Only the PnL, not cost + PnL. `tied` counts open positions only, so a closed position's
     # cost was never subtracted here to begin with -- adding it back would credit the account
     # with money it never spent.
+    #
+    # Summed over every position, not just closed ones: a position that has been partially sold
+    # is still open and has already banked the PnL of the part that went.
     realized = con.execute(
         """SELECT COALESCE(SUM(realized_pnl), 0) FROM positions
-           WHERE run_id=? AND open=0""", (run_id,)).fetchone()[0]
+           WHERE run_id=?""", (run_id,)).fetchone()[0]
     return float(start[0]) - float(tied) + float(realized)
 
 
@@ -517,9 +617,12 @@ def run_summary(con: sqlite3.Connection, run_id: int) -> dict:
         "orders": q("SELECT COUNT(*) FROM orders WHERE run_id=?"),
         "positions_open": q("SELECT COUNT(*) FROM positions WHERE run_id=? AND open=1"),
         "positions_closed": q("SELECT COUNT(*) FROM positions WHERE run_id=? AND open=0"),
-        "fees_paid": q("SELECT COALESCE(SUM(fees_paid),0) FROM positions WHERE run_id=?"),
+        # Both columns: `fees_paid` is what open shares still carry, `fees_realized` is what
+        # has already been expensed. Their sum is what the run has actually paid the exchange.
+        "fees_paid": q("""SELECT COALESCE(SUM(fees_paid),0) + COALESCE(SUM(fees_realized),0)
+                          FROM positions WHERE run_id=?"""),
         "realized_pnl": q(
-            "SELECT COALESCE(SUM(realized_pnl),0) FROM positions WHERE run_id=? AND open=0"),
+            "SELECT COALESCE(SUM(realized_pnl),0) FROM positions WHERE run_id=?"),
         "cash": run_cash(con, run_id),
     }
 

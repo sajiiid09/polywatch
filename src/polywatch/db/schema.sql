@@ -197,11 +197,16 @@ CREATE TABLE IF NOT EXISTS orders (
     filled_shares REAL NOT NULL DEFAULT 0,
     avg_price     REAL,
     fee           REAL NOT NULL DEFAULT 0,
-    status        TEXT NOT NULL,            -- 'filled' | 'partial' | 'rejected'
+    status        TEXT NOT NULL,            -- 'filled' | 'partial' | 'rejected' | 'unknown'
+    -- The CLOB's order id. Only reconciliation needs it, and only when `status` is 'unknown' --
+    -- but that is precisely the case where the row is the only thread back to the order, so it
+    -- is recorded on every live order rather than on the ones we later wish we had it for.
+    exchange_id   TEXT,
     reason        TEXT,
     ts            INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_orders_run ON orders(run_id, ts);
+CREATE INDEX IF NOT EXISTS idx_orders_unknown ON orders(run_id, status) WHERE status = 'unknown';
 
 CREATE TABLE IF NOT EXISTS positions (
     id            INTEGER PRIMARY KEY,
@@ -210,12 +215,18 @@ CREATE TABLE IF NOT EXISTS positions (
     condition_id  TEXT NOT NULL,
     shares        REAL NOT NULL,
     avg_price     REAL NOT NULL,
-    cost_usd      REAL NOT NULL,            -- excludes fees; fees_paid is tracked separately
+    cost_usd      REAL NOT NULL,            -- excludes fees; the two fee columns track those
+    -- Entry fees attributable to the shares STILL HELD. Scaled down when part of a position is
+    -- sold, so the remainder's cost basis is the cost of the remainder and nothing more.
     fees_paid     REAL NOT NULL DEFAULT 0,
+    -- Fees already expensed against realized_pnl: entry fees on shares that have gone, plus
+    -- every exit fee. fees_paid + fees_realized is what the position has cost in fees overall.
+    fees_realized REAL NOT NULL DEFAULT 0,
     opened_ts     INTEGER NOT NULL,
     closed_ts     INTEGER,
     close_reason  TEXT,                     -- which rung of the exit ladder fired
-    realized_pnl  REAL,
+    -- Banked PnL. Accumulates across partial exits, so it is non-NULL on open positions too.
+    realized_pnl  REAL NOT NULL DEFAULT 0,
     open          INTEGER NOT NULL DEFAULT 1
 );
 CREATE INDEX IF NOT EXISTS idx_positions_run_open ON positions(run_id, open);

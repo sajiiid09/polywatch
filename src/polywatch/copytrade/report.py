@@ -47,7 +47,12 @@ def run_report(con, run_id: int, task=None) -> str:
         f"run {run_id}  task {run['task']}  {run['mode'].upper()}",
         f"  started        {_dt(run['started_at'])}   stopped {_dt(run['stopped_at'])}"
         f"   ({run['stop_reason'] or 'running'})",
-        f"  bankroll       ${run['start_bankroll']:,.2f} -> ${s['cash']:,.2f}",
+        # `end_bankroll` is equity, written when the run closed out. Falling back to cash for a
+        # run still in flight is right: nothing has marked its open positions yet.
+        f"  bankroll       ${run['start_bankroll']:,.2f} -> "
+        f"${(run['end_bankroll'] if run['end_bankroll'] is not None else s['cash']):,.2f}"
+        + ("" if not s["positions_open"] else
+           f"   (${s['cash']:,.2f} cash, {s['positions_open']} position(s) still open)"),
         f"  realized pnl   ${s['realized_pnl']:+,.2f}   fees ${s['fees_paid']:,.2f}",
         f"  signals        {s['signals_seen']} seen, {s['copied']} copied, "
         f"{s['skipped']} skipped",

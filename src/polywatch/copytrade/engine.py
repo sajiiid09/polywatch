@@ -34,6 +34,7 @@ from ..fetch.client import Client, FetchError
 from ..parse import records
 from . import book as bk
 from . import exits
+from . import reconcile
 from .execution import Executor, Fill
 from .task import Task
 
@@ -46,6 +47,14 @@ META_TTL_S = 600
 # round trip cannot be won at that entry -- which is a reason to stop asking, not to post the
 # order anyway.
 MAX_RESTING_TARGET = 0.97
+
+
+class ReconcileError(RuntimeError):
+    """The exchange and the database disagree, so this run will not trade.
+
+    Raised rather than returned because there is no partial version of this failure: a run that
+    cannot verify what it holds has nothing safe to do next.
+    """
 
 
 @dataclass
@@ -62,6 +71,7 @@ class RunState:
     trader_account_usd: float = 0.0
     polls: int = 0
     errors: int = 0
+    adopted: int = 0
     stop_reason: str | None = None
 
 
@@ -149,8 +159,61 @@ class Engine:
         self.state = RunState(run_id=run_id, started_at=self.now(), start_bankroll=t.bankroll,
                               last_seen_ts=self.now())
         self.state.trader_account_usd = self._trader_account()
+        self.reconcile("start")
         self.log(self.banner())
         return self.state
+
+    # --- reconciliation -----------------------------------------------------------------
+
+    def reconcile(self, when: str) -> None:
+        """Make the database agree with the exchange, or refuse to trade.
+
+        Paper mode has no exchange to disagree with, so this is a no-op there. Live, it is the
+        gate between believing we hold something and knowing it -- see `RULES.md` L5.
+        """
+        s = self.state
+        resolutions, problems = reconcile.check(self.con, s.run_id, self.ex)
+        for r in resolutions:
+            self._adopt(r)
+        if not problems:
+            return
+        self.log(reconcile.describe(problems))
+        store.finish_run(self.con, s.run_id, s.start_bankroll, "reconcile_failed")
+        s.stop_reason = "reconcile_failed"
+        raise ReconcileError(f"reconciliation failed at {when}: "
+                             f"{len(problems)} discrepancy(ies)")
+
+    def _adopt(self, r: reconcile.Resolution) -> None:
+        """Book what an order turned out to have done, once the exchange has said so."""
+        s = self.state
+        if r.shares <= 0:
+            store.resolve_order(self.con, r.order_id, "rejected", 0.0, None, 0.0,
+                                "reconciled: nothing matched")
+            self.log(f"  reconciled order {r.order_id}: nothing matched")
+            return
+
+        meta = self.market_meta(r.condition_id)
+        fee = bk.fee(r.shares, r.avg_price, self.fee_rate(meta))
+        store.resolve_order(self.con, r.order_id, "filled", r.shares, r.avg_price, fee,
+                            f"reconciled via {r.source}")
+        if r.side != "BUY":
+            # A sell we could not confirm is settled by the shortfall check rather than here:
+            # the shares are simply gone from both views, and `close` already wrote the exit.
+            self.log(f"  reconciled sell {r.order_id}: {r.shares:.1f} @ {r.avg_price:.3f}")
+            return
+
+        held = store.open_position_for(self.con, s.run_id, r.token_id)
+        cost = r.shares * r.avg_price
+        if held is None:
+            store.open_position(self.con, {
+                "run_id": s.run_id, "token_id": r.token_id, "condition_id": r.condition_id,
+                "shares": r.shares, "avg_price": r.avg_price, "cost_usd": cost,
+                "fees_paid": fee, "opened_ts": self.now()})
+        else:
+            store.add_to_position(self.con, held["id"], r.shares, cost, fee)
+        s.adopted += 1
+        self.log(f"  adopted {r.shares:.1f} shares @ {r.avg_price:.3f} from order "
+                 f"{r.order_id} ({r.source})")
 
     def banner(self) -> str:
         t, s = self.task, self.state
@@ -194,6 +257,11 @@ class Engine:
                     self.log(f"  ! poll failed: {e}")
                 s.polls += 1
 
+                # An order the exchange accepted without saying what it matched is a question,
+                # and the loop does not get to ask another one until it is answered.
+                if store.unknown_orders(self.con, s.run_id):
+                    self.reconcile("tick")
+
                 stop = self.check_breakers()
                 if stop:
                     s.stop_reason = stop
@@ -204,6 +272,11 @@ class Engine:
                 nap = t.poll_interval_s - (time.monotonic() - tick)
                 if nap > 0:
                     time.sleep(nap)
+        except ReconcileError:
+            # Already logged, and `reconcile` closed the run row. Deliberately not routed through
+            # `stop()`: flattening means selling, and selling is the thing we have just decided
+            # we cannot safely do.
+            return self._summary("reconcile_failed")
         except KeyboardInterrupt:
             s.stop_reason = "interrupted"
         return self.stop(s.stop_reason or "stopped")
@@ -287,6 +360,12 @@ class Engine:
     def _portfolio_gates(self, ev: dict, held) -> str | None:
         """Gates that depend on our book rather than on the trade."""
         s, t = self.state, self.task
+        # Buying the other outcome of a market we are already in pays two entry fees and two
+        # exit fees to arrive at roughly no exposure. It is not a hedge, it is a round trip with
+        # the profit removed, so it is refused rather than sized down.
+        if held is None and store.open_position_other_outcome(
+                self.con, s.run_id, ev["condition_id"], ev["token_id"]) is not None:
+            return "holds_other_outcome"
         if held is None and len(store.open_positions(self.con, s.run_id)) >= t.max_concurrent:
             return "max_concurrent"
         exposure = store.market_exposure(self.con, s.run_id, ev["condition_id"])
@@ -442,21 +521,17 @@ class Engine:
         """Write a completed exit to the position, whole or partial.
 
         A partial fill is left open with the remainder rather than closed at an average that
-        never traded: the shares are still there, and the next tick will try again.
+        never traded: the shares are still there, and the next tick will try again. The
+        arithmetic of splitting cost and fees across the two halves lives in
+        `store.settle_position`, which is also what keeps the remainder's stop-loss honest.
         """
         s = self.state
-        if fill.shares < pos["shares"] - 1e-6:
-            remaining = pos["shares"] - fill.shares
-            frac = fill.shares / pos["shares"]
-            self.con.execute(
-                """UPDATE positions SET shares=?, cost_usd=cost_usd*?, fees_paid=fees_paid+?
-                   WHERE id=?""",
-                (remaining, 1 - frac, fill.fee, pos["id"]))
-            self.con.commit()
+        pnl, closed = store.settle_position(self.con, pos["id"], fill.shares, fill.cost,
+                                            fill.fee, reason)
+        if not closed:
             self.log(f"  ~ partial exit {fill.shares:.1f}/{pos['shares']:.1f} "
-                     f"@ {fill.avg_price:.3f} ({reason})")
+                     f"@ {fill.avg_price:.3f} ({reason})  pnl ${pnl:+.2f}")
             return
-        pnl = store.close_position(self.con, pos["id"], fill.cost, fill.fee, reason)
         s.high_water.pop(pos["id"], None)
         self.log(f"  - sell {fill.shares:.1f} @ {fill.avg_price:.3f}  {reason}  "
                  f"pnl ${pnl:+.2f}")
@@ -469,6 +544,7 @@ class Engine:
             "intent_usd": intent_usd, "limit_price": fill.limit_price,
             "book_vwap": vwap or fill.book_vwap, "filled_shares": fill.shares,
             "avg_price": fill.avg_price or None, "fee": fill.fee, "status": fill.status,
+            "exchange_id": fill.exchange_id,
             "reason": reason or fill.reason, "ts": self.now()})
 
     # --- position management ------------------------------------------------------------
@@ -495,12 +571,19 @@ class Engine:
                 self.close(pos, d.reason)
 
     def check_resting(self, pos, book: dict, rate: float) -> bool:
-        """Did a resting take-profit fill? Returns True when the position is now closed."""
+        """Did a resting take-profit fill? Returns True when the position is now closed.
+
+        A resting order can fill in pieces, and a piece is not a settlement: the order stays on
+        the book for the remainder and only its `filled_shares` moves.
+        """
         for row in store.resting_for_position(self.con, pos["id"]):
             fill = self.ex.resting_fill(dict(row), book, fee_rate=rate)
             if fill is None:
                 continue
-            store.settle_resting(self.con, row["id"], "filled", fill.shares, fill.avg_price)
+            whole = fill.shares >= row["shares"] - 1e-6
+            store.settle_resting(self.con, row["id"], "filled" if whole else "open",
+                                 fill.shares, fill.avg_price,
+                                 reason=None if whole else "partially filled")
             self._log_order(None, {"token_id": pos["token_id"],
                                    "condition_id": pos["condition_id"]},
                             "SELL", fill.cost, fill.avg_price, fill, reason=exits.TAKE_PROFIT)
@@ -554,11 +637,27 @@ class Engine:
                 ok = self.ex.cancel(row["exchange_id"]) if row["exchange_id"] else True
                 store.settle_resting(self.con, row["id"], "cancelled" if ok else "open",
                                      reason="run ended")
+        summary = self._summary(reason)
+        # The run ends on equity, not cash. `cash` subtracts what open positions tie up and adds
+        # nothing back for what they are worth, so a run that deliberately left positions open
+        # would otherwise report their entire cost basis as a loss that never happened.
+        store.finish_run(self.con, s.run_id, summary["equity"], reason)
+        return summary
+
+    def _summary(self, reason: str) -> dict:
+        s = self.state
         summary = store.run_summary(self.con, s.run_id)
-        store.finish_run(self.con, s.run_id, summary["cash"], reason)
+        summary["unrealized_pnl"] = self.unrealized() if summary["positions_open"] else 0.0
+        # Cash is what is not tied up; equity is cash plus what the open positions would fetch.
+        # Both are reported because they answer different questions -- what can still be staked,
+        # and what the account is worth.
+        summary["equity"] = summary["cash"] + summary["unrealized_pnl"] + sum(
+            (p["cost_usd"] or 0.0) + (p["fees_paid"] or 0.0)
+            for p in store.open_positions(self.con, s.run_id))
         summary["stop_reason"] = reason
         summary["latency"] = store.latency_stats(self.con, s.run_id)
         summary["polls"] = s.polls
+        summary["adopted"] = s.adopted
         summary["run_id"] = s.run_id
         return summary
 

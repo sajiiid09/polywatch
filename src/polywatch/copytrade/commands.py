@@ -15,7 +15,7 @@ from ..db import store
 from ..fetch.client import Client
 from . import book as bk
 from . import execution, report
-from .engine import Engine
+from .engine import Engine, ReconcileError
 from .task import PRESETS, Task, preset
 
 
@@ -187,7 +187,17 @@ def _run(con, args) -> int:
     client = Client(con=con, rps=MAX_RPS, dump_raw=False, log_ok=False,
                     timeout=POLL_TIMEOUT_S)
     eng = Engine(con, t, ex, client)
-    summary = eng.run()
+    try:
+        summary = eng.run()
+    except ReconcileError as e:
+        # The banner never printed, because the run refused to start. Say so plainly and leave
+        # the run row closed with its reason, so `task report` explains it too.
+        print(f"\n{e}")
+        last = store.last_run(con, t.name)
+        if last is not None:
+            print()
+            print(report.run_report(con, last["id"], t))
+        return 1
     print()
     print(report.run_report(con, summary["run_id"], t))
     return 0
