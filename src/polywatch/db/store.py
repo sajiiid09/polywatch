@@ -79,7 +79,10 @@ def init_db(con: sqlite3.Connection) -> None:
     have = {r["name"] for r in con.execute("PRAGMA table_info(trader_scores)")}
     for col, decl in (("capture_ratio", "REAL"), ("edge_half_life_s", "REAL"),
                       ("hold_p50_s", "INTEGER"), ("fee_adjusted_roi", "REAL"),
-                      ("recent_roi", "REAL"), ("luck_p", "REAL"), ("excluded", "TEXT")):
+                      ("recent_roi", "REAL"), ("luck_p", "REAL"), ("excluded", "TEXT"),
+                      # ...and before a wallet carried a strategy label. Denormalised from
+                      # trader_strategy so the shortlist prints it without a join.
+                      ("archetype", "TEXT"), ("strategy_confidence", "REAL")):
         if col not in have:
             con.execute(f"ALTER TABLE trader_scores ADD COLUMN {col} {decl}")
     con.commit()
@@ -761,7 +764,8 @@ TRADER_SCORE_COLUMNS = ("address", "scanned_at", "n_closed", "win_rate", "roi", 
                         "brier", "avg_entry_price", "avg_stake_usd", "max_drawdown",
                         "consistency", "est_account_usd", "top_category", "persona_fit",
                         "rank_score", "capture_ratio", "edge_half_life_s", "hold_p50_s",
-                        "fee_adjusted_roi", "recent_roi", "luck_p", "excluded", "metrics_json")
+                        "fee_adjusted_roi", "recent_roi", "luck_p", "excluded",
+                        "archetype", "strategy_confidence", "metrics_json")
 
 
 def upsert_trader_score(con: sqlite3.Connection, row: dict) -> None:
@@ -961,3 +965,273 @@ def latency_stats(con: sqlite3.Connection, run_id: int | None = None) -> dict:
 
     return {"n": len(xs), "min": xs[0], "p50": pct(50), "p90": pct(90), "p99": pct(99),
             "max": xs[-1], "mean": sum(xs) / len(xs)}
+
+
+# --- strategy learning ----------------------------------------------------
+# What kind of trader a wallet is, and how that kind performed when copied. The aggregators here
+# are the whole input to copytrade/learn.py: they turn "0xab.. lost $9" into "longshot-hunters
+# lost $9 across 40 positions", which is the difference between a fact and a finding.
+
+TRADER_STRATEGY_COLUMNS = ("address", "scanned_at", "archetype", "confidence", "evidence_n",
+                           "entry_p50", "hold_p50_s", "pre_drift_p50", "resolution_frac",
+                           "cut_ratio", "sell_frac", "cat_hhi", "top_category", "scores_json",
+                           "features_json")
+
+
+def upsert_trader_strategy(con: sqlite3.Connection, row: dict) -> None:
+    row = dict(row)
+    row["address"] = str(row["address"]).lower()
+    row.setdefault("scanned_at", int(time.time()))
+    for c in TRADER_STRATEGY_COLUMNS:
+        row.setdefault(c, None)
+    row = {c: row[c] for c in TRADER_STRATEGY_COLUMNS}
+    cols = ",".join(TRADER_STRATEGY_COLUMNS)
+    binds = ",".join(f":{c}" for c in TRADER_STRATEGY_COLUMNS)
+    sets = ",".join(f"{c}=excluded.{c}" for c in TRADER_STRATEGY_COLUMNS if c != "address")
+    con.execute(f"INSERT INTO trader_strategy ({cols}) VALUES ({binds}) "
+                f"ON CONFLICT(address) DO UPDATE SET {sets}", row)
+    con.commit()
+
+
+def set_trader_archetype(con: sqlite3.Connection, address: str, archetype: str,
+                         confidence: float) -> None:
+    """Copy the label onto an existing score row, so the shortlist prints it without a join."""
+    con.execute("UPDATE trader_scores SET archetype=?, strategy_confidence=? WHERE address=?",
+                (archetype, confidence, address.lower()))
+    con.commit()
+
+
+def get_trader_strategy(con: sqlite3.Connection, address: str) -> sqlite3.Row | None:
+    return con.execute("SELECT * FROM trader_strategy WHERE address=?",
+                       (address.lower(),)).fetchone()
+
+
+def strategies(con: sqlite3.Connection) -> list[sqlite3.Row]:
+    return con.execute("SELECT * FROM trader_strategy ORDER BY archetype, confidence DESC"
+                       ).fetchall()
+
+
+def archetype_wallets(con: sqlite3.Connection) -> dict[str, dict]:
+    """Per archetype: how many wallets carry it, and their median rank and capture ratio.
+
+    Medians rather than means because both distributions have a long tail and one exceptional
+    wallet should not make its whole archetype look copyable.
+    """
+    rows = con.execute(
+        """SELECT s.archetype, t.rank_score, t.capture_ratio
+           FROM trader_strategy s LEFT JOIN trader_scores t ON t.address = s.address"""
+    ).fetchall()
+    out: dict[str, dict] = {}
+    for r in rows:
+        d = out.setdefault(r[0], {"n_traders": 0, "ranks": [], "captures": []})
+        d["n_traders"] += 1
+        if r[1] is not None:
+            d["ranks"].append(float(r[1]))
+        if r[2] is not None:
+            d["captures"].append(float(r[2]))
+    for d in out.values():
+        d["median_rank_score"] = _median(d.pop("ranks"))
+        d["median_capture_ratio"] = _median(d.pop("captures"))
+    return out
+
+
+def _median(xs: list[float]) -> float | None:
+    if not xs:
+        return None
+    xs = sorted(xs)
+    mid = len(xs) // 2
+    return xs[mid] if len(xs) % 2 else (xs[mid - 1] + xs[mid]) / 2
+
+
+# A position records which trader's signal opened it -- but only since that column existed.
+# Rows written before it are NULL, and refusing to attribute them would leave every historical
+# run in one 'unknown' bucket. Where the run's task names exactly one wallet there is no
+# ambiguity to resolve, so the task's trader is used. Where it names several, the row stays
+# unattributed rather than being assigned a guess: a wrong attribution is worse than a missing
+# one, because it moves PnL onto an archetype that did not earn it.
+_POSITION_TRADER = """COALESCE(p.trader,
+                               CASE WHEN COALESCE(tt.n, 1) <= 1 THEN tk.trader END)"""
+_POSITION_JOINS = """LEFT JOIN task_runs r ON r.id = p.run_id
+                     LEFT JOIN tasks tk ON tk.name = r.task
+                     LEFT JOIN (SELECT task, COUNT(*) n FROM task_traders GROUP BY task) tt
+                            ON tt.task = r.task"""
+
+
+def archetype_pnl(con: sqlite3.Connection, run_id: int | None = None) -> dict[str, dict]:
+    """Closed and open position outcomes grouped by the archetype of the trader copied.
+
+    Positions whose trader can be neither recorded nor recovered group under 'unknown' rather
+    than being dropped: an unattributed position is a gap in the record, and silently excluding
+    it would flatter whatever archetypes happen to have been profiled.
+    """
+    sql = f"""SELECT COALESCE(s.archetype, 'unknown') AS a,
+                    COUNT(*), SUM(p.open),
+                    SUM(COALESCE(p.realized_pnl, 0)),
+                    SUM(COALESCE(p.fees_paid, 0) + COALESCE(p.fees_realized, 0)),
+                    SUM(CASE WHEN p.open=0 AND COALESCE(p.realized_pnl,0) > 0 THEN 1 ELSE 0 END),
+                    SUM(CASE WHEN p.open=0 THEN 1 ELSE 0 END)
+             FROM positions p
+             {_POSITION_JOINS}
+             LEFT JOIN trader_strategy s ON s.address = {_POSITION_TRADER}"""
+    args: tuple = ()
+    if run_id is not None:
+        sql += " WHERE p.run_id=?"
+        args = (run_id,)
+    sql += " GROUP BY a"
+    out = {}
+    for r in con.execute(sql, args):
+        closed = int(r[6] or 0)
+        out[r[0]] = {
+            "n_positions": int(r[1] or 0),
+            "open": int(r[2] or 0),
+            "closed": closed,
+            "realized_pnl": float(r[3] or 0.0),
+            "fees": float(r[4] or 0.0),
+            "wins": int(r[5] or 0),
+            "win_rate": (int(r[5] or 0) / closed) if closed else None,
+        }
+    return out
+
+
+def archetype_signals(con: sqlite3.Connection, run_id: int | None = None) -> dict[str, dict]:
+    """Signals seen, copied and skipped, grouped by archetype, with each one's skip histogram.
+
+    The split is the point. "fee_floor dominates" is a verdict on the market; "fee_floor
+    dominates for favourite-grinders and stale dominates for scalpers" says which kind of
+    trader to stop shortlisting, which is a decision someone can act on.
+    """
+    sql = """SELECT COALESCE(s.archetype, 'unknown') AS a, g.action, g.reason, COUNT(*)
+             FROM signals g LEFT JOIN trader_strategy s ON s.address = g.trader"""
+    args: tuple = ()
+    if run_id is not None:
+        sql += " WHERE g.run_id=?"
+        args = (run_id,)
+    sql += " GROUP BY a, g.action, g.reason"
+    out: dict[str, dict] = {}
+    for arch, action, reason, n in con.execute(sql, args):
+        d = out.setdefault(arch, {"seen": 0, "copied": 0, "skipped": 0, "skips": {}})
+        d["seen"] += n
+        if action == "copied":
+            d["copied"] += n
+        else:
+            d["skipped"] += n
+            if reason:
+                d["skips"][reason] = d["skips"].get(reason, 0) + n
+    for d in out.values():
+        d["skips"] = sorted(d["skips"].items(), key=lambda kv: -kv[1])
+    return out
+
+
+def archetype_exits(con: sqlite3.Connection, run_id: int | None = None) -> dict[str, list]:
+    """Which rung of the exit ladder fired, grouped by archetype. NULL reads as session_end,
+    matching report.exit_mix -- a position flattened at the close did exit, for a reason."""
+    sql = f"""SELECT COALESCE(s.archetype, 'unknown') AS a,
+                    COALESCE(p.close_reason, 'session_end'), COUNT(*),
+                    SUM(COALESCE(p.realized_pnl, 0))
+             FROM positions p
+             {_POSITION_JOINS}
+             LEFT JOIN trader_strategy s ON s.address = {_POSITION_TRADER}
+             WHERE p.open=0"""
+    args: tuple = ()
+    if run_id is not None:
+        sql += " AND p.run_id=?"
+        args = (run_id,)
+    sql += " GROUP BY a, 2 ORDER BY COUNT(*) DESC"
+    out: dict[str, list] = {}
+    for arch, reason, n, pnl in con.execute(sql, args):
+        out.setdefault(arch, []).append((reason, int(n), float(pnl or 0.0)))
+    return out
+
+
+STRATEGY_SNAPSHOT_COLUMNS = ("taken_at", "archetype", "n_traders", "n_positions", "n_signals",
+                             "n_copied", "realized_pnl", "fees", "win_rate",
+                             "median_capture_ratio", "median_rank_score", "top_skip_reason",
+                             "top_exit_reason")
+
+
+def insert_strategy_snapshot(con: sqlite3.Connection, rows: list[dict]) -> int:
+    """Append one batch of per-archetype rows. Append, never upsert: the question these answer
+    is a trend, and overwriting last month's row erases the only evidence of drift."""
+    prepared = []
+    for row in rows:
+        r = dict(row)
+        r.setdefault("taken_at", int(time.time()))
+        for c in ("n_traders", "n_positions", "n_signals", "n_copied"):
+            if r.get(c) is None:
+                r[c] = 0
+        for c in STRATEGY_SNAPSHOT_COLUMNS:
+            r.setdefault(c, None)
+        prepared.append({c: r[c] for c in STRATEGY_SNAPSHOT_COLUMNS})
+    cols = ",".join(STRATEGY_SNAPSHOT_COLUMNS)
+    binds = ",".join(f":{c}" for c in STRATEGY_SNAPSHOT_COLUMNS)
+    con.executemany(f"INSERT INTO strategy_snapshots ({cols}) VALUES ({binds})", prepared)
+    con.commit()
+    return len(prepared)
+
+
+def strategy_snapshots(con: sqlite3.Connection, since: int | None = None,
+                       archetype: str | None = None) -> list[sqlite3.Row]:
+    sql = "SELECT * FROM strategy_snapshots WHERE 1=1"
+    args: list = []
+    if since is not None:
+        sql += " AND taken_at >= ?"
+        args.append(since)
+    if archetype is not None:
+        sql += " AND archetype = ?"
+        args.append(archetype)
+    return con.execute(sql + " ORDER BY taken_at, archetype", tuple(args)).fetchall()
+
+
+def all_runs(con: sqlite3.Connection, task: str | None = None) -> list[sqlite3.Row]:
+    sql = "SELECT * FROM task_runs"
+    args: tuple = ()
+    if task is not None:
+        sql += " WHERE task=?"
+        args = (task,)
+    return con.execute(sql + " ORDER BY started_at", args).fetchall()
+
+
+# --- sessions -------------------------------------------------------------
+# The handoff between one run of the operator and the next. See the comment on the table in
+# schema.sql for why the briefing text lives in the database and not only in docs/PROGRESS.md.
+
+SESSION_COLUMNS = ("task", "run_id", "mode", "operator", "opened_at", "closed_at",
+                   "start_equity", "end_equity", "realized_pnl", "fees", "signals_seen",
+                   "copied", "skipped", "positions_open", "positions_closed",
+                   "top_skip_reason", "top_exit_reason", "stop_reason", "resting_open",
+                   "dropped_traders", "briefing_md", "next_steps_json", "note")
+
+
+def insert_session(con: sqlite3.Connection, row: dict) -> int:
+    r = dict(row)
+    r.setdefault("closed_at", int(time.time()))
+    for c in SESSION_COLUMNS:
+        r.setdefault(c, None)
+    r = {c: r[c] for c in SESSION_COLUMNS}
+    cols = ",".join(SESSION_COLUMNS)
+    binds = ",".join(f":{c}" for c in SESSION_COLUMNS)
+    cur = con.execute(f"INSERT INTO sessions ({cols}) VALUES ({binds})", r)
+    con.commit()
+    return int(cur.lastrowid)
+
+
+def last_session(con: sqlite3.Connection, task: str) -> sqlite3.Row | None:
+    return con.execute(
+        "SELECT * FROM sessions WHERE task=? ORDER BY closed_at DESC, id DESC LIMIT 1",
+        (task,)).fetchone()
+
+
+def sessions(con: sqlite3.Connection, task: str | None = None,
+             limit: int = 20) -> list[sqlite3.Row]:
+    sql = "SELECT * FROM sessions"
+    args: list = []
+    if task is not None:
+        sql += " WHERE task=?"
+        args.append(task)
+    args.append(limit)
+    return con.execute(sql + " ORDER BY closed_at DESC, id DESC LIMIT ?", tuple(args)).fetchall()
+
+
+def session_for_run(con: sqlite3.Connection, run_id: int) -> sqlite3.Row | None:
+    return con.execute("SELECT * FROM sessions WHERE run_id=? ORDER BY id DESC LIMIT 1",
+                       (run_id,)).fetchone()

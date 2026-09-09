@@ -14,7 +14,8 @@ from ..config import ENV_FUNDER, ENV_PRIVATE_KEY, MAX_RPS, POLL_TIMEOUT_S
 from ..db import store
 from ..fetch.client import Client
 from . import book as bk
-from . import execution, report, stream
+from . import execution, learn, report, session, stream
+from . import discover, strategy as strategy_mod
 from .engine import Engine, ReconcileError
 from .task import PRESETS, Task, preset
 
@@ -245,12 +246,150 @@ def _run(con, args) -> int:
         if last is not None:
             print()
             print(report.run_report(con, last["id"], t))
+            # A run that refused to start is exactly the run whose handoff matters: the next
+            # operator has to be told the exchange disagreed with us before they try again.
+            _close_session(con, t.name, last["id"], args)
         return 1
     finally:
         if feed is not None:
             feed.stop()
     print()
     print(report.run_report(con, summary["run_id"], t))
+    _close_session(con, t.name, summary["run_id"], args)
+    return 0
+
+
+def _close_session(con, task: str, run_id: int, args) -> None:
+    """Record the handoff. Failing to write it must not fail the run -- the trading is already
+    done and its record is already in the database; this is the narrative on top of it."""
+    if getattr(args, "no_session_log", False):
+        return
+    try:
+        h = session.close(con, task, run_id, note=getattr(args, "note", "") or "",
+                          operator=getattr(args, "operator", None) or "agent")
+    except Exception as e:                                   # noqa: BLE001
+        print(f"\n  could not write the session handoff: {e}")
+        return
+    print()
+    print("  session recorded. next steps:")
+    for i, step in enumerate(h.steps, 1):
+        print(f"    {i}. {step}")
+
+
+# --- `polywatch strategy` -------------------------------------------------
+# What kind of traders are being copied, how those kinds have performed, and what the numbers
+# suggest changing. Nothing here applies anything: see RULES.md I8.
+
+
+def strategy_dispatch(args) -> int:
+    con = store.connect(args.db)
+    store.init_db(con)
+    return {"profile": _strategy_profile, "show": _strategy_show, "learn": _strategy_learn,
+            "backfill": _strategy_backfill}[args.strategy_cmd](con, args)
+
+
+def _strategy_profile(con, args) -> int:
+    address = args.address.lower()
+    row = store.get_trader_strategy(con, address)
+    if row is None:
+        print(f"  no strategy profile for {address}.\n"
+              f"  `polywatch trader {address}` scores and classifies a wallet in one pass.")
+        return 1
+    if args.json:
+        print(json.dumps(dict(row), indent=2))
+        return 0
+    print()
+    print(f"  wallet     {row['address']}")
+    print(f"  scanned    {report._dt(row['scanned_at'])} UTC")
+    prof = strategy_mod.StrategyProfile(
+        address=row["address"], archetype=row["archetype"], confidence=row["confidence"] or 0.0,
+        evidence_n=row["evidence_n"] or 0,
+        scores=json.loads(row["scores_json"] or "{}"),
+        features=json.loads(row["features_json"] or "{}"))
+    print(strategy_mod.format_profile(prof))
+    return 0
+
+
+def _strategy_backfill(con, args) -> int:
+    n = discover.backfill_strategies(con, limit=args.limit, min_trades=args.min_trades)
+    print(f"  classified {n} wallet(s) from stored trades. No requests were made.")
+    print("  `strategy learn` will now have something to group by.")
+    return 0
+
+
+def _strategy_show(con, args) -> int:
+    f, props, obs = learn.learn(con, task=args.task, write=False)
+    if args.json:
+        print(json.dumps({"archetypes": f.archetypes, "skips": f.skips,
+                          "proposals": [p.__dict__ for p in props],
+                          "observations": obs}, indent=2, default=str))
+        return 0
+    print()
+    print(learn.format_findings(f, props, obs))
+    print("\n  nothing above has been applied. `strategy learn` writes it to "
+          "docs/STRATEGY_LEARNED.md.")
+    return 0
+
+
+def _strategy_learn(con, args) -> int:
+    from ..config import LEARNED_DOC
+    f, props, obs = learn.learn(con, task=args.task, write=True)
+    if args.json:
+        print(json.dumps({"archetypes": f.archetypes,
+                          "proposals": [p.__dict__ for p in props],
+                          "observations": obs}, indent=2, default=str))
+        return 0
+    print()
+    print(learn.format_findings(f, props, obs))
+    print(f"\n  written to {LEARNED_DOC}")
+    print("  every proposal in it is UNAPPLIED; applying one is a human decision.")
+    return 0
+
+
+# --- `polywatch session` --------------------------------------------------
+# The handoff between one operator and the next. `open` prints and changes nothing.
+
+
+def session_dispatch(args) -> int:
+    con = store.connect(args.db)
+    store.init_db(con)
+    return {"open": _session_open, "close": _session_close,
+            "log": _session_log}[args.session_cmd](con, args)
+
+
+def _session_open(con, args) -> int:
+    if store.get_task(con, args.name) is None:
+        print(f"no task {args.name}")
+        return 1
+    print()
+    print(session.format_open(con, args.name))
+    return 0
+
+
+def _session_close(con, args) -> int:
+    if store.get_task(con, args.name) is None:
+        print(f"no task {args.name}")
+        return 1
+    from ..config import PROGRESS_DOC
+    h = session.close(con, args.name, args.run_id, note=args.note or "",
+                      operator=args.operator or "human")
+    if args.json:
+        print(json.dumps({"task": h.task, "run_id": h.run_id, "warnings": h.warnings,
+                          "next_steps": h.steps}, indent=2))
+        return 0
+    print()
+    print(session.briefing(h))
+    print(f"  appended to {PROGRESS_DOC}")
+    return 0
+
+
+def _session_log(con, args) -> int:
+    rows = store.sessions(con, args.name, limit=args.limit)
+    if args.json:
+        print(json.dumps([dict(r) for r in rows], indent=2))
+        return 0
+    print()
+    print(session.format_log(rows))
     return 0
 
 

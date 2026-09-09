@@ -205,3 +205,41 @@ RANK_WEIGHTS = {
     "recent": 1.0,         # recent form over lifetime
     "drawdown": 1.0,       # a disqualifier, not a virtue
 }
+
+
+# --- Strategy classification ------------------------------------------------------------------
+# What kind of trader a wallet is. Rule-based over trades already in the database rather than
+# clustered or labelled by a model: the point of a label is that it is stable and arguable, and a
+# wallet has to classify the same way twice for an archetype's track record to mean anything.
+
+# How far before a fill to read the price, to tell buying-into-a-move from fading one. 300s
+# because WINDOW_PRE_S is 300 -- this is the history the replay backfill already fetches, so
+# classification costs no extra requests.
+PRE_DRIFT_S = 300
+
+# A wallet with fewer trades than this is not classified at all. Same floor as the luck test,
+# for the same reason: below it a label describes the sample, not the trader.
+MIN_ARCHETYPE_TRADES = MIN_SAMPLE_FOR_LUCK
+
+# The margin between the top two archetype scores that counts as a decisive call. Scores are all
+# in [0,1] and a wallet usually looks a bit like several things, so raw margins are small; this
+# is the divisor that turns one into a 0..1 confidence. 0.15 means "a 0.15 gap is certain".
+ARCHETYPE_MARGIN_SCALE = 0.15
+# Below this confidence the wallet is 'unclassified'. An honest refusal to label beats a coin
+# flip presented as a verdict -- the same reason skill.py reports a thin metric as missing.
+MIN_ARCHETYPE_CONFIDENCE = 0.25
+
+# How many copied positions an archetype needs before its PnL is allowed to propose anything.
+# Under this it is reported as an observation instead.
+MIN_ARCHETYPE_POSITIONS = 15
+
+# A skip reason has to be this share of a run's skips before it counts as dominating it.
+SKIP_DOMINANCE_FRAC = 0.35
+
+
+# --- Generated documents ----------------------------------------------------------------------
+# Written by the bot, read by whoever operates it next. Kept out of STRATEGY.md, which is
+# hand-written and stays that way: a machine must not overwrite reasoning it did not derive.
+DOCS = ROOT / "docs"
+LEARNED_DOC = DOCS / "STRATEGY_LEARNED.md"
+PROGRESS_DOC = DOCS / "PROGRESS.md"
