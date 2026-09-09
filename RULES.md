@@ -44,6 +44,20 @@ Paper fills against the real live book, bounded by the same limit price a live o
 Its documented optimism is queue position and depth timing — never price. A paper fill at a price
 the live book was not showing is a bug.
 
+**I8 — A learned finding is a proposal, never an application.**
+`copytrade/learn.py` reads the run record, groups it by trader archetype, and writes
+`docs/STRATEGY_LEARNED.md` and a `strategy_snapshots` row. It writes nothing else: not a `Task`,
+not a knob, not a roster, not a default in `config.py`. §6 below says a change contradicting a
+measured finding needs a new measurement rather than an argument, and that applies to the bot's
+own findings first. A proposal also carries its sample size or it is not one — anything under the
+floor is demoted to an observation rather than inflated into a recommendation.
+
+**I9 — A session hands over information, never state.**
+`Engine.start` closes an abandoned run rather than adopting it, seeds the watermark to *now*, and
+discards the trailing high-water marks. `polywatch session open` prints the last session's
+briefing and restores none of that. A run started after a handoff inherits no positions, no
+watermark and no high-water mark, and the briefing says so where an operator will read it.
+
 ## 2. Live-mode gates
 
 Every one of these must hold before a signed order is posted.
@@ -122,6 +136,10 @@ produces a bot that sits calmly through a total loss because it has not sold yet
   still logged** — the flag is `log_ok`, not `log`.
 - Re-ingestion is idempotent. Trades dedupe on a natural key, markets upsert, and price windows
   already recorded are never refetched.
+- `docs/STRATEGY_LEARNED.md` and `docs/PROGRESS.md` are **outputs**, regenerated and appended
+  by the program. Editing them by hand loses the edit at the next run and desynchronises the
+  copy of the same text stored in `sessions.briefing_md`. Add a human note with
+  `session close --note`, and put reasoning that should survive in `STRATEGY.md` or an ADR.
 - Rate limiting is self-imposed and global across threads. Polymarket publishes no limit for these
   public endpoints; we impose one rather than discover theirs the hard way.
 

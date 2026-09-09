@@ -187,3 +187,33 @@ Stated in advance so a paper run can settle it:
 - If `max_hold` dominates the exit mix, their edge is slower than the task assumes.
 - If replay shows `capture_ratio` below ~0.3 at 15 seconds, there is nothing here for a copier
   regardless of how good the wallet is.
+
+## 11. What the record says, as opposed to what this document says
+
+Everything above is hand-written and stays that way. It is a thesis, and its numbers are claims
+someone measured and can defend.
+
+Underneath it there is now a second document, [`docs/STRATEGY_LEARNED.md`](docs/STRATEGY_LEARNED.md),
+which is generated whole by `polywatch strategy learn` and which no human should edit. It groups
+every copied position, refusal and exit by the **archetype** of the trader it came from —
+longshot-hunter, favourite-grinder, resolution-holder, scalper, and so on — rather than by
+wallet address. The distinction is the point: a wallet goes quiet and takes its record with it,
+where a pattern accumulates. When this account eventually trades on a thesis of its own instead
+of copying one, that accumulated file is what it will have to argue from.
+
+Two rules govern the boundary between the two documents.
+
+**A generated finding is a proposal, never an application** (`RULES.md` I8). The learning pass
+writes documents and snapshot rows. It does not touch a task, a knob or a roster, and a proposal
+in it has been applied to nothing. §6 of `RULES.md` already says a change contradicting a
+measurement needs a new measurement rather than an argument; a bot able to quietly widen its own
+`max_fee_frac` after a bad afternoon has risk limits in name only.
+
+**A proposal carries its sample size, or it is not a proposal.** Anything under the floor is
+demoted to an observation. A rule that fires on four positions is not a small finding; it is
+noise with a recommendation attached.
+
+The archetype is not decoration. §3 above shows a round trip costing 10% of stake at 0.50 and
+0.5% at 0.95, and `longshot-hunter` and `favourite-grinder` sit at opposite ends of that curve —
+so the label is, among other things, a prediction about fee drag made before a single trade is
+copied.

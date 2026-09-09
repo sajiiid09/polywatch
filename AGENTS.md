@@ -49,8 +49,9 @@ violation. So is a SQL string outside `db/store.py`.
 
 ## Purity
 
-`book.py`, `exits.py`, `skill.py` and `screen.py` are pure: dicts in, numbers out, no network and
-no database. That is what makes the exit ladder testable without a market and the skill metrics
+`book.py`, `exits.py`, `skill.py`, `screen.py` and `strategy.py` are pure: dicts in, numbers out,
+no network and no database. So are `learn.proposals` / `render` and `session.next_steps` /
+`briefing`, which is what makes the judgement in them testable without a run. That is what makes the exit ladder testable without a market and the skill metrics
 testable without a wallet. Keep them that way — if a function there needs the clock or the network,
 the caller passes it in (`now=`, `fee_rate=`, `high_water=`).
 
@@ -67,6 +68,20 @@ mapping in `commands._build`.
 **A schema column or table** → `schema.sql` for new databases, *and* an additive `PRAGMA
 table_info` block in `store.init_db` for existing ones. `CREATE TABLE IF NOT EXISTS` will not add a
 column to a table that already exists. There are 1 GB of existing data; it must keep opening.
+
+**A strategy archetype** → a scoring function in `strategy._scores` and a line in
+`strategy.describe`, gated through `_gated` on the feature that *defines* it. Keep the set coarse
+for the same reason as skip reasons: the archetype is the grouping key of every learned finding,
+so near-synonyms destroy the signal the grouping exists to produce. An archetype that cannot be
+measured must score a flat 0.5 rather than inherit a high score from components it shares with a
+neighbour — that is what stopped `momentum-chaser` and `fade-the-move` tying at the top of every
+wallet with no price history.
+
+**A proposal rule** → a named function in `learn.py`, added to `RULES`, with its own test. It
+returns a list, because the honest answer most of the time is an empty one. It must carry `n` and
+a confidence, and it must not propose past what the data supports — `learn.stale_rule` is the
+worked example: it checks the latency split and proposes nothing when the delay belongs to the
+feed.
 
 **A new skip reason** → a short, coarse string. These become the histogram in `task report`, which
 is the main output of a paper run, so a proliferation of near-synonyms destroys the signal. Name it
@@ -102,11 +117,20 @@ too — `fee_source` exists as a column precisely so a guess is visible downstre
 - Money spent in exactly one class (`RULES.md` I5).
 - Every SQL statement in one file (`RULES.md` I6).
 - Every observed trader action recorded with a reason (`RULES.md` I1, I2).
+- Learned findings that propose and never apply (`RULES.md` I8).
+- A session that hands over information and never state (`RULES.md` I9).
 - The existing test suite, green.
 - Databases created by earlier versions, still opening.
 
 ## Working agreement for agents
 
+- **Start with `polywatch session open <task>` and end with `polywatch session close <task>`.**
+  That is how the account stays one continuous operator across sessions that share nothing else:
+  the briefing says what is held, what is still live on the exchange, and what was left undone.
+  It is a briefing and not a resume — verify what it says is still true before acting on it.
+  `task run` closes the session for you unless `--no-session-log` is passed.
+- `docs/STRATEGY_LEARNED.md` and `docs/PROGRESS.md` are generated. Do not edit them by hand
+  (`RULES.md` §5); reasoning that should survive belongs in `STRATEGY.md` or an ADR.
 - Read `STRATEGY.md` and `RULES.md` before changing trading behaviour. A change that contradicts a
   measured finding needs a new measurement, not an argument.
 - Record decisions in `docs/decisions/` as short ADRs. Update `STRATEGY.md` / `RULES.md` in the

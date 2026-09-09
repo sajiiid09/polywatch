@@ -37,10 +37,12 @@ from ..db import store
 from ..fetch import polymarket as api
 from ..fetch.client import Client, FetchError
 from ..parse import records
+from .. import screen
 from . import book as bk
 from . import rank
 from . import replay as replay_mod
 from . import skill
+from . import strategy as strategy_mod
 
 # Trade pages pulled per candidate for hold times and replay. Four pages is 4000 fills, which
 # covers months for a human and days for something that should not have survived screening.
@@ -211,6 +213,19 @@ def score_trader(con, client: Client, address: str, max_pages: int = MAX_CLOSED_
                                 _rate_lookup(con), lags)
         store.upsert_trader_replay(con, address, [r.as_row() for r in res.lags])
 
+    # What kind of trader this is, from the rows just fetched and the price windows replay just
+    # backfilled -- so the label costs no extra requests. `screen.profile_wallet` supplies the
+    # cadence features rather than this module recomputing timing statistics that already exist.
+    cadence = None
+    if trades:
+        cadence = screen.profile_wallet(
+            {"address": address, "username": None, "vol": None, "pnl": None},
+            trades, int(time.time())).as_row()
+    prof = strategy_mod.profile(address, trades, closed,
+                                price_at=lambda tok, ts: store.price_at(con, tok, ts),
+                                category_of=_category_lookup(con), cadence=cadence)
+    store.upsert_trader_strategy(con, prof.as_row())
+
     ranked = rank.rank(sc, res)
     store.upsert_trader_score(con, {
         "address": sc.address,
@@ -234,7 +249,10 @@ def score_trader(con, client: Client, address: str, max_pages: int = MAX_CLOSED_
         "recent_roi": sc.recent_roi,
         "luck_p": sc.luck_p,
         "excluded": ranked.excluded,
-        "metrics_json": json.dumps({**sc.as_row(), "components": ranked.components}),
+        "archetype": prof.archetype,
+        "strategy_confidence": prof.confidence,
+        "metrics_json": json.dumps({**sc.as_row(), "components": ranked.components,
+                                    "strategy": prof.features}),
     })
     return sc, est_account, res
 
@@ -298,7 +316,8 @@ def format_shortlist(rows) -> str:
                 "  most often a capture ratio saying their edge does not outlive being copied.\n"
                 "  `--include-excluded` shows those and why.")
     head = (f"  {'wallet':14} {'rank':>5} {'settled':>7} {'roi':>8} {'fee roi':>8} "
-            f"{'capture':>7} {'half-life':>9} {'hold':>7} {'luck p':>7}  category")
+            f"{'capture':>7} {'half-life':>9} {'hold':>7} {'luck p':>7}  "
+            f"{'archetype':18} category")
     out = [head, "  " + "-" * (len(head) - 2)]
     for r in rows:
         half = "-" if r["edge_half_life_s"] is None else f"{r['edge_half_life_s']:,.0f}s"
@@ -308,12 +327,14 @@ def format_shortlist(rows) -> str:
         froi = "-" if r["fee_adjusted_roi"] is None else f"{r['fee_adjusted_roi']:+.1%}"
         out.append(f"  {r['address'][:14]:14} {(r['rank_score'] or 0):5.2f} "
                    f"{r['n_closed']:7} {(r['roi'] or 0):+8.1%} {froi:>8} {cap:>7} {half:>9} "
-                   f"{hold:>7} {luck:>7}  {r['top_category'] or ''}"
+                   f"{hold:>7} {luck:>7}  {(r['archetype'] or '-'):18} "
+                   f"{r['top_category'] or ''}"
                    + (f"   EXCLUDED: {r['excluded']}" if r["excluded"] else ""))
     return "\n".join(out)
 
 
-def format_score(sc: skill.SkillScore, est_account: float, username: str | None = None) -> str:
+def format_score(sc: skill.SkillScore, est_account: float, username: str | None = None,
+                 strategy_row=None) -> str:
     """A one-wallet score card, for `polywatch trader`."""
     brier = "n/a" if sc.brier is None else f"{sc.brier:.4f} over {sc.n_brier} settled"
     calib = ""
@@ -361,6 +382,20 @@ def format_score(sc: skill.SkillScore, est_account: float, username: str | None 
     elif sc.n_closed:
         lines.append(f"  luck test         not run -- {sc.n_closed} settled positions is too "
                      f"few to say anything")
+    if strategy_row is not None:
+        # Placed with the copying half rather than the trader half: an archetype is a statement
+        # about what copying this wallet would be like, not a compliment about their record.
+        lines += ["", f"  strategy          {strategy_row['archetype']}  "
+                      f"(confidence {(strategy_row['confidence'] or 0):.2f})",
+                  f"                    {strategy_mod.describe(strategy_row['archetype'])}"]
+        drift = strategy_row["pre_drift_p50"]
+        if drift is not None:
+            moved = "into a move already underway" if drift > 0 else "against the recent move"
+            lines.append(f"  pre-entry drift   {drift:+.4f} in the 5 min before their buys "
+                         f"-- they buy {moved}")
+        if strategy_row["resolution_frac"] is not None and strategy_row["resolution_frac"] > 0.5:
+            lines.append("                    most of their buys are never sold: their exit is "
+                         "settlement, so follow_exit will not fire")
     if sc.top_category:
         lines.append(f"  earns most in     {sc.top_category}"
                      + (f"   (concentration {sc.category_concentration:.2f})"
@@ -376,3 +411,40 @@ def _dur(seconds: int | None) -> str:
     if seconds < 5400:
         return f"{seconds / 60:.0f}m"
     return f"{seconds / 3600:.1f}h"
+
+
+def backfill_strategies(con, *, limit: int | None = None, min_trades: int = 20,
+                        log=print) -> int:
+    """Classify every wallet whose trades are already stored. No network.
+
+    Discovery classifies as it scores, but a database that predates the classifier holds a
+    million fills and no labels, and refetching them to derive something already derivable would
+    be absurd. So this reads `trades` and nothing else.
+
+    What it cannot do is compute category concentration: that comes from settled positions with
+    realized PnL, which are not stored. `cat_hhi` therefore comes back None and
+    `event-specialist` scores neutral -- reported as missing rather than defaulted, which is why
+    a backfilled label can differ from one produced by a full `polywatch trader` pass.
+    """
+    addresses = [r[0] for r in con.execute(
+        "SELECT wallet, COUNT(*) c FROM trades GROUP BY wallet HAVING c >= ? "
+        "ORDER BY c DESC" + (" LIMIT ?" if limit else ""),
+        (min_trades, limit) if limit else (min_trades,))]
+    price_at = lambda tok, ts: store.price_at(con, tok, ts)          # noqa: E731
+    now = int(time.time())
+    done = 0
+    for i, address in enumerate(addresses, 1):
+        rows = [dict(r) for r in store.trades_for(con, address)]
+        if not rows:
+            continue
+        cadence = screen.profile_wallet(
+            {"address": address, "username": None, "vol": None, "pnl": None},
+            rows, now).as_row()
+        prof = strategy_mod.profile(address, rows, None, price_at=price_at, cadence=cadence)
+        store.upsert_trader_strategy(con, prof.as_row())
+        if store.get_trader_score(con, address) is not None:
+            store.set_trader_archetype(con, address, prof.archetype, prof.confidence)
+        done += 1
+        if i % 50 == 0:
+            log(f"  {i}/{len(addresses)} classified")
+    return done

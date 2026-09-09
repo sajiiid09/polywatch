@@ -187,6 +187,14 @@ def main(argv=None) -> int:
                           "optional `stream` extra")
     trn.add_argument("--no-stream", action="store_true",
                      help="poll for books even when streaming is available")
+    # A run ends by recording what it did and what is left for whoever is next. On by default:
+    # the sessions worth handing over are the ones nobody remembered to log.
+    trn.add_argument("--no-session-log", action="store_true",
+                     help="do not write a session handoff when the run ends")
+    trn.add_argument("--note", default=None,
+                     help="free text carried into this run's session handoff")
+    trn.add_argument("--operator", default=None,
+                     help="who is running it: a name, 'agent', 'human'")
 
     trp = tsub.add_parser("report", help="what a run did")
     trp.add_argument("name")
@@ -195,6 +203,42 @@ def main(argv=None) -> int:
 
     tor = tsub.add_parser("orders", help="resting GTC orders left on the book")
     tor.add_argument("--cancel", action="store_true", help="cancel every live one")
+
+    # `polywatch strategy` -- what kind of traders are being copied, and what the record of
+    # those kinds suggests. Nothing here applies anything (RULES.md I8).
+    sg = sub.add_parser("strategy", help="trader archetypes, learned findings, proposals")
+    sgs = sg.add_subparsers(dest="strategy_cmd", required=True)
+    sp = sgs.add_parser("profile", help="one wallet's archetype and the features behind it")
+    sp.add_argument("address")
+    sp.add_argument("--json", action="store_true")
+    sb = sgs.add_parser("backfill", help="classify every wallet already in the trades table "
+                                        "(offline; no requests)")
+    sb.add_argument("--limit", type=int, default=None, help="only the N busiest wallets")
+    sb.add_argument("--min-trades", type=int, default=20,
+                    help="skip wallets with fewer stored trades than this")
+    for name, helptext in (("show", "findings and proposals; writes nothing"),
+                           ("learn", "recompute, snapshot, and regenerate the learned doc")):
+        sl = sgs.add_parser(name, help=helptext)
+        sl.add_argument("--task", default=None,
+                        help="scope to one task; default pools every task")
+        sl.add_argument("--json", action="store_true")
+
+    # `polywatch session` -- the handoff between one operator of the account and the next.
+    sn = sub.add_parser("session", help="account handoff: brief the next operator, record this one")
+    sns = sn.add_subparsers(dest="session_cmd", required=True)
+    so = sns.add_parser("open", help="print the last session's briefing (does NOT resume state)")
+    so.add_argument("name")
+    sc = sns.add_parser("close", help="record account state and write the handoff")
+    sc.add_argument("name")
+    sc.add_argument("--run-id", type=int, default=None,
+                    help="which run to close out; default is the task's last")
+    sc.add_argument("--note", default=None, help="free text carried into the handoff")
+    sc.add_argument("--operator", default=None, help="who ran it: a name, 'agent', 'human'")
+    sc.add_argument("--json", action="store_true")
+    sll = sns.add_parser("log", help="recent sessions, newest first")
+    sll.add_argument("name", nargs="?", default=None)
+    sll.add_argument("--limit", type=int, default=10)
+    sll.add_argument("--json", action="store_true")
 
     args = p.parse_args(argv)
 
@@ -285,8 +329,11 @@ def main(argv=None) -> int:
         client = Client(con=con, rps=args.rps)
         sc, est, res = discover.score_trader(con, client, args.address, max_pages=args.pages,
                                              with_replay=not args.no_replay)
+        strat = store.get_trader_strategy(con, args.address)
         if args.json:
             out = {**sc.as_row(), "est_account_usd": est}
+            if strat is not None:
+                out["strategy"] = dict(strat)
             if res is not None:
                 out["replay"] = {"lags": [r.as_row() for r in res.lags],
                                  "capture_ratio": res.capture_ratio,
@@ -296,7 +343,8 @@ def main(argv=None) -> int:
         row = con.execute("SELECT username FROM wallets WHERE address=?",
                           (args.address.lower(),)).fetchone()
         print()
-        print(discover.format_score(sc, est, row["username"] if row else None))
+        print(discover.format_score(sc, est, row["username"] if row else None,
+                                    strategy_row=strat))
         if res is not None:
             print()
             print(replay_mod.format_curve(res))
@@ -308,6 +356,14 @@ def main(argv=None) -> int:
     if args.cmd == "task":
         from .copytrade import commands
         return commands.dispatch(args)
+
+    if args.cmd == "strategy":
+        from .copytrade import commands
+        return commands.strategy_dispatch(args)
+
+    if args.cmd == "session":
+        from .copytrade import commands
+        return commands.session_dispatch(args)
 
     return 1
 

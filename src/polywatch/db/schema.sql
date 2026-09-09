@@ -285,6 +285,10 @@ CREATE TABLE IF NOT EXISTS trader_scores (
     recent_roi       REAL,                  -- exponentially weighted toward recent form
     luck_p           REAL,                  -- bootstrap p-value that the record is not variance
     excluded         TEXT,                  -- why this wallet is not a candidate; NULL if it is
+    -- Denormalised from trader_strategy so the shortlist can print a label without a join, the
+    -- same reason the `tasks` table carries copies of its own config_json fields.
+    archetype        TEXT,                  -- what kind of trader this is; see trader_strategy
+    strategy_confidence REAL,
     metrics_json     TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_trader_scores_rank ON trader_scores(rank_score DESC);
@@ -349,3 +353,96 @@ CREATE TABLE IF NOT EXISTS resting_orders (
     settled_ts    INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_resting_run_status ON resting_orders(run_id, status);
+
+-- --------------------------------------------------------------------------------------------
+-- Strategy learning. What kind of trader a wallet is, and how that kind has actually performed
+-- when copied. The point is that a paper run's PnL currently attributes to an address and stops
+-- there: "0xab.. made $4" is not a finding, "favourite-grinders made $4 across 31 positions
+-- while longshot-hunters lost $9 across 40" is. Nothing here is applied automatically -- see
+-- RULES.md I8.
+-- --------------------------------------------------------------------------------------------
+
+-- One row per wallet, derived from trades already in the DB. A rescan overwrites cleanly, the
+-- same contract as trader_scores.
+CREATE TABLE IF NOT EXISTS trader_strategy (
+    address         TEXT PRIMARY KEY,
+    scanned_at      INTEGER NOT NULL,
+    archetype       TEXT NOT NULL,          -- see copytrade/strategy.ARCHETYPES
+    confidence      REAL NOT NULL,          -- margin over the runner-up, shrunk by sample size
+    evidence_n      INTEGER NOT NULL,       -- matched round trips the features rest on
+    -- The features that decided it, denormalised so a label can be argued with in SQL rather
+    -- than only in Python. The full vector is in features_json.
+    entry_p50       REAL,                   -- median round-trip entry price; the fee axis
+    hold_p50_s      INTEGER,
+    pre_drift_p50   REAL,                   -- price move in the 5 min BEFORE they bought:
+                                            -- positive is momentum, negative is fading
+    resolution_frac REAL,                   -- share of buys never sold, i.e. held to settlement
+    cut_ratio       REAL,                   -- mean win % / mean loss %; >1 is a longshot shape
+    sell_frac       REAL,                   -- a buy-only wallet cannot be followed out
+    cat_hhi         REAL,
+    top_category    TEXT,
+    scores_json     TEXT,                   -- every archetype's score, so a 0.51/0.49 is visible
+    features_json   TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_trader_strategy_archetype ON trader_strategy(archetype);
+
+-- Append-only time series: how each archetype performed when copied, as of one `strategy learn`
+-- run. Append rather than upsert because the question this answers is a trend -- an archetype
+-- that paid in September and stopped paying in October is the finding, and an upsert would
+-- erase exactly that.
+CREATE TABLE IF NOT EXISTS strategy_snapshots (
+    id                    INTEGER PRIMARY KEY,
+    taken_at              INTEGER NOT NULL,
+    archetype             TEXT NOT NULL,
+    n_traders             INTEGER NOT NULL DEFAULT 0,
+    n_positions           INTEGER NOT NULL DEFAULT 0,
+    n_signals             INTEGER NOT NULL DEFAULT 0,
+    n_copied              INTEGER NOT NULL DEFAULT 0,
+    realized_pnl          REAL,
+    fees                  REAL,
+    win_rate              REAL,
+    median_capture_ratio  REAL,
+    median_rank_score     REAL,
+    top_skip_reason       TEXT,
+    top_exit_reason       TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_strategy_snapshots_taken ON strategy_snapshots(taken_at);
+
+-- --------------------------------------------------------------------------------------------
+-- Agent continuity. A run is bounded by a wall clock and deliberately inherits nothing from its
+-- predecessor (see copytrade/engine.py: an abandoned run is closed, not adopted, and a trailing
+-- stop set before this process was watching means nothing). That is right for trading state and
+-- wrong for the operator, who has to pick the account up knowing what the last session found.
+--
+-- So a session hands over two things: this row, which is machine state, and a written briefing.
+-- briefing_md is stored here rather than only in docs/PROGRESS.md because RULES.md I1 says a
+-- finished run must be explicable from the database alone, and a handoff that exists only as a
+-- file on disk is not.
+-- --------------------------------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS sessions (
+    id                INTEGER PRIMARY KEY,
+    task              TEXT NOT NULL,
+    run_id            INTEGER REFERENCES task_runs(id),   -- NULL when a session ran no engine
+    mode              TEXT,
+    operator          TEXT,                 -- free label: 'agent', 'human', a name. Advisory
+    opened_at         INTEGER,
+    closed_at         INTEGER NOT NULL,
+    start_equity      REAL,
+    end_equity        REAL,
+    realized_pnl      REAL,
+    fees              REAL,
+    signals_seen      INTEGER,
+    copied            INTEGER,
+    skipped           INTEGER,
+    positions_open    INTEGER,
+    positions_closed  INTEGER,
+    top_skip_reason   TEXT,
+    top_exit_reason   TEXT,
+    stop_reason       TEXT,
+    resting_open      INTEGER,              -- GTC sells still on the book when we stopped
+    dropped_traders   TEXT,                 -- comma-separated; auto-drops persist across runs
+    briefing_md       TEXT,                 -- the text handed to the next session, verbatim
+    next_steps_json   TEXT,                 -- the same instructions, structured
+    note              TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_sessions_task ON sessions(task, closed_at);
