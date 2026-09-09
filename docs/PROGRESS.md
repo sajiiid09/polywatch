@@ -13,6 +13,22 @@ gets edited by hand.
 **Nothing in here is applied automatically.** The next steps are instructions for an operator,
 not a queue the bot drains.
 
+## 2026-09-09 15:48 UTC — task `alpha` (run 1)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 15:48 → 2026-09-09 15:48
+- **equity** $100.00 → $100.00 (+0.00)
+- **realized** $0.00 after $0.10 of fees
+- **signals** 0 seen, 0 copied, 0 skipped
+- **positions** 0 closed, 1 open
+
+**Attention**
+- 1 position(s) are still open and NO STOP-LOSS IS RUNNING ON THEM. The CLOB has no stop order type, so a stop is a price this process watches; while nothing is running, nothing is watching. Either start a run to manage them or close them by hand.
+
+**By trader archetype** — `unknown` 1 pos $0.00
+
+**Next steps**
+1. Decide about the open positions first: run the task to resume managing them, or flatten them by hand. Nothing is watching them meanwhile.
+
 ## 2026-09-09 15:23 UTC — task `alpha` (run 1)
 
 - **mode** paper · **stopped** session_end · **ran** 2026-09-09 15:23 → 2026-09-09 15:23

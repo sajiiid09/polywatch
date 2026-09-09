@@ -59,10 +59,15 @@ set -a; source .env; set +a             # nothing auto-loads .env; it is gitigno
 polywatch account --live-check          # keys, wallet type, CLOB auth — places no order
 ```
 
-Two things the preflight cannot check: that the account's USDC allowances are approved (they are,
-if it has ever traded through the Polymarket UI — otherwise the first order fails on allowance),
-and that `POLYMARKET_SIGNATURE_TYPE` matches how the account was created. A mismatch is not
-dangerous, but every order comes back rejected at the signature check without saying why.
+The preflight authenticates, then reads the account's USDC balance and its exchange allowances.
+A freshly created account has approved nothing, and Polymarket's contracts can only move USDC
+they are approved to move — so the first live order fails on allowance until one trade has been
+placed through the web UI, which sets the approvals as a side effect. The preflight says so
+rather than letting the order find out.
+
+The one thing it cannot check is that `POLYMARKET_SIGNATURE_TYPE` matches how the account was
+created. A mismatch is not dangerous, but every order comes back rejected at the signature check
+without saying why.
 
 `--yes` skips the typed `LIVE` confirmation. Outside a terminal it is refused unless
 `POLYWATCH_UNATTENDED=1` is set as well, because the same flag that saves a person one keystroke

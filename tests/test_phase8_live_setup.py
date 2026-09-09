@@ -73,6 +73,36 @@ def test_format_preflight_says_ready_only_when_every_check_passed():
     assert "not ready" not in account.format_preflight([("a", True, ""), ("b", True, "")])
 
 
+# --- collateral: the checks that decide whether an order can settle -----------------------
+
+def test_a_funded_and_approved_account_passes_both_collateral_checks():
+    rows = account.collateral_rows(
+        {"balance": "25000000", "allowances": {"0xa": "1000000", "0xb": "0"}})
+    assert all(ok for _, ok, _ in rows)
+    assert "$25.00" in _row(rows, "USDC balance")[2]
+    assert "1/2" in _row(rows, "allowances")[2]
+
+
+def test_usdc_is_read_with_six_decimals_not_eighteen():
+    assert "$1.00" in _row(account.collateral_rows({"balance": "1000000"}), "USDC balance")[2]
+
+
+def test_an_empty_account_fails_the_balance_check():
+    assert _row(account.collateral_rows({"balance": "0"}), "USDC balance")[1] is False
+
+
+def test_a_never_traded_account_fails_on_allowances_before_it_fails_on_an_order():
+    rows = account.collateral_rows(
+        {"balance": "10000000", "allowances": {"0xa": "0", "0xb": "0"}})
+    assert _row(rows, "USDC balance")[1] is True
+    assert _row(rows, "allowances")[1] is False
+    assert "Polymarket UI" in _row(rows, "allowances")[2]
+
+
+def test_a_response_missing_the_allowance_map_is_read_as_unapproved():
+    assert _row(account.collateral_rows({"balance": "10000000"}), "allowances")[1] is False
+
+
 # --- address resolution ---------------------------------------------------------------------
 
 def test_the_funder_is_the_account_read_by_default(clean_env):

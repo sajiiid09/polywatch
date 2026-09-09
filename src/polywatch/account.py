@@ -126,11 +126,43 @@ def live_preflight() -> list[tuple[str, bool, str]]:
         return rows
     try:
         from .copytrade.execution import LiveExecutor
-        LiveExecutor()
+        ex = LiveExecutor()
         rows.append(("CLOB auth", True, "authenticated; credentials work"))
     except Exception as e:  # noqa: BLE001 - any failure here is a failed preflight
         rows.append(("CLOB auth", False, f"{type(e).__name__}: {e}"))
+        return rows
+
+    try:
+        from py_clob_client.clob_types import AssetType, BalanceAllowanceParams
+        resp = ex.client.get_balance_allowance(
+            BalanceAllowanceParams(asset_type=AssetType.COLLATERAL))
+    except Exception as e:  # noqa: BLE001
+        rows.append(("USDC balance", False, f"could not read: {type(e).__name__}: {e}"))
+        return rows
+    rows.extend(collateral_rows(resp))
     return rows
+
+
+def collateral_rows(resp: dict) -> list[tuple[str, bool, str]]:
+    """Balance and allowance checks, read from one get_balance_allowance response.
+
+    The allowance one is the check an operator otherwise discovers by having their first live
+    order rejected. Polymarket's exchange contracts can only move USDC the account has approved
+    them to move, and a freshly created account has approved nothing -- the approvals happen as
+    a side effect of the first trade placed through the web UI, which an account driven only by
+    this program never makes.
+
+    USDC has six decimals on Polygon, which is why the raw balance is divided rather than read.
+    """
+    bal = float(resp.get("balance") or 0) / 1e6
+    allow = {k: float(v or 0) / 1e6 for k, v in (resp.get("allowances") or {}).items()}
+    approved = sum(1 for v in allow.values() if v > 0)
+    return [
+        ("USDC balance", bal > 0, f"${bal:,.2f}" + ("" if bal > 0 else " -- nothing to trade with")),
+        ("allowances", approved > 0,
+         f"{approved}/{len(allow)} exchange contracts approved" if approved else
+         "none approved -- place one trade in the Polymarket UI to set them"),
+    ]
 
 
 def format_preflight(rows: list[tuple[str, bool, str]]) -> str:
