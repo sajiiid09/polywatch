@@ -117,6 +117,8 @@ too — `fee_source` exists as a column precisely so a guess is visible downstre
 - Money spent in exactly one class (`RULES.md` I5).
 - Every SQL statement in one file (`RULES.md` I6).
 - Every observed trader action recorded with a reason (`RULES.md` I1, I2).
+- `Executor.resting_fill` returning the shares filled **since the last check**, never the
+  running total. The engine settles the position by what it returns.
 - Learned findings that propose and never apply (`RULES.md` I8).
 - A session that hands over information and never state (`RULES.md` I9).
 - The existing test suite, green.

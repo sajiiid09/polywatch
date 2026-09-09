@@ -141,6 +141,14 @@ MAX_ENTRY_PRICE = 0.95
 ENV_PRIVATE_KEY = "POLYMARKET_PRIVATE_KEY"
 ENV_FUNDER = "POLYMARKET_FUNDER"        # the proxy/funder address that holds the USDC
 ENV_API_CREDS = ("POLYMARKET_API_KEY", "POLYMARKET_API_SECRET", "POLYMARKET_API_PASSPHRASE")
+# Opt-in for live trading with no terminal attached. `--yes` alone is a person skipping a
+# confirmation they have already read; `--yes` from cron is money moving with nobody watching,
+# and only the operator can tell the two apart.
+ENV_UNATTENDED = "POLYWATCH_UNATTENDED"
+# Which wallet signs. 1 is the email/magic-login proxy, 2 a browser wallet's proxy, 0 a bare EOA
+# that holds its own USDC. Wrong value means every order is rejected at the signature check.
+ENV_SIGNATURE_TYPE = "POLYMARKET_SIGNATURE_TYPE"
+DEFAULT_SIGNATURE_TYPE = 1
 CLOB_CHAIN_ID = 137                      # Polygon mainnet
 
 # Fee floor. A round trip costs 2 * rate * min(p, 1-p) / p of the stake -- 10% at even odds in

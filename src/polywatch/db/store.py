@@ -447,6 +447,14 @@ def running_runs(con: sqlite3.Connection, task: str | None = None) -> list[sqlit
     return con.execute(sql + " ORDER BY started_at", args).fetchall()
 
 
+def get_run(con: sqlite3.Connection, run_id: int) -> sqlite3.Row | None:
+    return con.execute("SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
+
+
+def run_count(con: sqlite3.Connection, task: str) -> int:
+    return con.execute("SELECT COUNT(*) FROM task_runs WHERE task=?", (task,)).fetchone()[0]
+
+
 def last_run(con: sqlite3.Connection, task: str) -> sqlite3.Row | None:
     return con.execute(
         "SELECT * FROM task_runs WHERE task=? ORDER BY started_at DESC LIMIT 1", (task,)
@@ -568,6 +576,21 @@ def recorded_shares(con: sqlite3.Connection, run_id: int, token_id: str) -> floa
     return float(row[0])
 
 
+def recorded_shares_anywhere(con: sqlite3.Connection, token_id: str, mode: str = "live") -> float:
+    """Shares of one token *any* run in this database is still holding.
+
+    The exchange answers for the whole account, not for one run, so this is the number an
+    account balance has to be diffed against. Asking only about the current run makes shares
+    left open by yesterday's run -- or bought by hand in the UI -- look like a surplus this
+    run's unresolved order can be credited with, which is how a position gets adopted twice.
+    """
+    row = con.execute(
+        """SELECT COALESCE(SUM(p.shares), 0) FROM positions p
+           JOIN task_runs r ON r.id = p.run_id
+           WHERE p.token_id=? AND p.open=1 AND r.mode=?""", (token_id, mode)).fetchone()
+    return float(row[0])
+
+
 def open_position(con: sqlite3.Connection, row: dict) -> int:
     row.setdefault("opened_ts", int(time.time()))
     row.setdefault("trader", None)
@@ -663,6 +686,10 @@ def close_position(con: sqlite3.Connection, position_id: int, proceeds_usd: floa
         raise KeyError(f"no position {position_id}")
     pnl, _ = settle_position(con, position_id, row["shares"], proceeds_usd, exit_fee, reason)
     return pnl
+
+
+def get_position(con: sqlite3.Connection, position_id: int) -> sqlite3.Row | None:
+    return con.execute("SELECT * FROM positions WHERE id=?", (position_id,)).fetchone()
 
 
 def open_positions(con: sqlite3.Connection, run_id: int) -> list[sqlite3.Row]:
@@ -906,6 +933,66 @@ def settle_resting(con: sqlite3.Connection, resting_id: int, status: str,
         (status, filled_shares, avg_price, reason, int(time.time()), resting_id),
     )
     con.commit()
+
+
+def unresolved_condition_ids(con: sqlite3.Connection) -> set[str]:
+    return {r[0] for r in con.execute("SELECT condition_id FROM markets WHERE resolved=0")}
+
+
+def resolved_token_ids(con: sqlite3.Connection) -> set[str]:
+    return {r[0] for r in con.execute(
+        """SELECT a.token_id FROM assets a
+           JOIN markets m ON m.condition_id = a.condition_id
+           WHERE m.resolved = 1""")}
+
+
+def wallets_by_rank(con: sqlite3.Connection) -> list[sqlite3.Row]:
+    return con.execute("SELECT * FROM wallets ORDER BY rank").fetchall()
+
+
+def screening_trades(con: sqlite3.Connection, wallet: str) -> list[sqlite3.Row]:
+    """The four columns behavioural screening reads. Deliberately not `SELECT *`: this runs once
+    per wallet over a table with a million rows in it."""
+    return con.execute(
+        "SELECT ts, side, size, condition_id FROM trades WHERE wallet=?", (wallet,)).fetchall()
+
+
+def closed_positions_for_run(con: sqlite3.Connection, run_id: int) -> list[sqlite3.Row]:
+    return con.execute(
+        "SELECT * FROM positions WHERE run_id=? AND open=0 ORDER BY closed_ts",
+        (run_id,)).fetchall()
+
+
+def close_reason_mix(con: sqlite3.Connection, run_id: int) -> list[sqlite3.Row]:
+    """(close_reason, n, realized) per exit rung for one run, commonest first."""
+    return con.execute(
+        """SELECT close_reason, COUNT(*), COALESCE(SUM(realized_pnl),0) FROM positions
+           WHERE run_id=? AND open=0 GROUP BY close_reason ORDER BY COUNT(*) DESC""",
+        (run_id,)).fetchall()
+
+
+def wallet_username(con: sqlite3.Connection, address: str) -> str | None:
+    row = con.execute("SELECT username FROM wallets WHERE address=?",
+                      (address.lower(),)).fetchone()
+    return row["username"] if row else None
+
+
+def wallets_by_trade_count(con: sqlite3.Connection, min_trades: int,
+                           limit: int | None = None) -> list[str]:
+    """Every wallet with at least `min_trades` stored fills, busiest first."""
+    sql = ("SELECT wallet FROM trades GROUP BY wallet HAVING COUNT(*) >= ? "
+           "ORDER BY COUNT(*) DESC")
+    args: tuple = (min_trades,)
+    if limit:
+        sql += " LIMIT ?"
+        args += (limit,)
+    return [r[0] for r in con.execute(sql, args)]
+
+
+def resting_by_mode(con: sqlite3.Connection, mode: str, status: str = "open"
+                    ) -> list[sqlite3.Row]:
+    return con.execute("SELECT * FROM resting_orders WHERE status=? AND mode=?",
+                       (status, mode)).fetchall()
 
 
 def orphan_resting(con: sqlite3.Connection, mode: str = "live") -> list[sqlite3.Row]:

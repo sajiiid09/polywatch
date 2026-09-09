@@ -13,6 +13,325 @@ gets edited by hand.
 **Nothing in here is applied automatically.** The next steps are instructions for an operator,
 not a queue the bot drains.
 
+## 2026-09-09 15:23 UTC — task `alpha` (run 1)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 15:23 → 2026-09-09 15:23
+- **equity** $100.00 → $100.00 (+0.00)
+- **realized** $0.00 after $0.10 of fees
+- **signals** 0 seen, 0 copied, 0 skipped
+- **positions** 0 closed, 1 open
+
+**Attention**
+- 1 position(s) are still open and NO STOP-LOSS IS RUNNING ON THEM. The CLOB has no stop order type, so a stop is a price this process watches; while nothing is running, nothing is watching. Either start a run to manage them or close them by hand.
+
+**By trader archetype** — `unknown` 1 pos $0.00
+
+**Next steps**
+1. Decide about the open positions first: run the task to resume managing them, or flatten them by hand. Nothing is watching them meanwhile.
+
+## 2026-09-09 15:22 UTC — task `alpha` (run 1)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 15:22 → 2026-09-09 15:22
+- **equity** $100.00 → $100.00 (+0.00)
+- **realized** $0.00 after $0.10 of fees
+- **signals** 0 seen, 0 copied, 0 skipped
+- **positions** 0 closed, 1 open
+
+**Attention**
+- 1 position(s) are still open and NO STOP-LOSS IS RUNNING ON THEM. The CLOB has no stop order type, so a stop is a price this process watches; while nothing is running, nothing is watching. Either start a run to manage them or close them by hand.
+
+**By trader archetype** — `unknown` 1 pos $0.00
+
+**Next steps**
+1. Decide about the open positions first: run the task to resume managing them, or flatten them by hand. Nothing is watching them meanwhile.
+
+## 2026-09-09 15:22 UTC — task `alpha` (run 1)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 15:22 → 2026-09-09 15:22
+- **equity** $100.00 → $100.00 (+0.00)
+- **realized** $0.00 after $0.10 of fees
+- **signals** 0 seen, 0 copied, 0 skipped
+- **positions** 0 closed, 1 open
+
+**Attention**
+- 1 position(s) are still open and NO STOP-LOSS IS RUNNING ON THEM. The CLOB has no stop order type, so a stop is a price this process watches; while nothing is running, nothing is watching. Either start a run to manage them or close them by hand.
+
+**By trader archetype** — `unknown` 1 pos $0.00
+
+**Next steps**
+1. Decide about the open positions first: run the task to resume managing them, or flatten them by hand. Nothing is watching them meanwhile.
+
+## 2026-09-09 11:04 UTC — task `alpha` (run 1)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 11:04 → 2026-09-09 11:04
+- **equity** $100.00 → $100.00 (+0.00)
+- **realized** $0.00 after $0.10 of fees
+- **signals** 0 seen, 0 copied, 0 skipped
+- **positions** 0 closed, 1 open
+
+**Attention**
+- 1 position(s) are still open and NO STOP-LOSS IS RUNNING ON THEM. The CLOB has no stop order type, so a stop is a price this process watches; while nothing is running, nothing is watching. Either start a run to manage them or close them by hand.
+
+**By trader archetype** — `unknown` 1 pos $0.00
+
+**Next steps**
+1. Decide about the open positions first: run the task to resume managing them, or flatten them by hand. Nothing is watching them meanwhile.
+
+## 2026-09-09 11:04 UTC — task `alpha` (run 1)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 11:04 → 2026-09-09 11:04
+- **equity** $100.00 → $100.00 (+0.00)
+- **realized** $0.00 after $0.10 of fees
+- **signals** 0 seen, 0 copied, 0 skipped
+- **positions** 0 closed, 1 open
+
+**Attention**
+- 1 position(s) are still open and NO STOP-LOSS IS RUNNING ON THEM. The CLOB has no stop order type, so a stop is a price this process watches; while nothing is running, nothing is watching. Either start a run to manage them or close them by hand.
+
+**By trader archetype** — `unknown` 1 pos $0.00
+
+**Next steps**
+1. Decide about the open positions first: run the task to resume managing them, or flatten them by hand. Nothing is watching them meanwhile.
+
+## 2026-09-09 11:03 UTC — task `sim2` (run 80)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 10:57 → 2026-09-09 11:03
+- **equity** $100.00 → $97.56 (-2.44)
+- **realized** $-1.84 after $0.82 of fees
+- **signals** 17 seen, 2 copied, 15 skipped
+- **positions** 1 closed, 1 open
+- **latency** median 14s behind the trader, feed 13.0s vs loop 0.4s
+
+**Attention**
+- 1 position(s) are still open and NO STOP-LOSS IS RUNNING ON THEM. The CLOB has no stop order type, so a stop is a price this process watches; while nothing is running, nothing is watching. Either start a run to manage them or close them by hand.
+
+**Why copies were refused** — `price_band` 6, `not_held` 5, `below_min_size` 3, `wide_spread` 1
+
+**How positions closed** — `stop_loss` 1 ($-1.84)
+
+**By trader archetype** — `market-maker` 2 pos $-1.84
+
+**By trader** — `0x1dda11b6` $0.00, `0x5a218c7a` $-1.84
+
+**Note** — verify stream resubscribe + open-position handoff
+
+**Next steps**
+1. Decide about the open positions first: run the task to resume managing them, or flatten them by hand. Nothing is watching them meanwhile.
+
+## 2026-09-09 10:59 UTC — task `alpha` (run 1)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 10:59 → 2026-09-09 10:59
+- **equity** $100.00 → $100.00 (+0.00)
+- **realized** $0.00 after $0.10 of fees
+- **signals** 0 seen, 0 copied, 0 skipped
+- **positions** 0 closed, 1 open
+
+**Attention**
+- 1 position(s) are still open and NO STOP-LOSS IS RUNNING ON THEM. The CLOB has no stop order type, so a stop is a price this process watches; while nothing is running, nothing is watching. Either start a run to manage them or close them by hand.
+
+**By trader archetype** — `unknown` 1 pos $0.00
+
+**Next steps**
+1. Decide about the open positions first: run the task to resume managing them, or flatten them by hand. Nothing is watching them meanwhile.
+
+## 2026-09-09 10:58 UTC — task `alpha` (run 1)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 10:58 → 2026-09-09 10:58
+- **equity** $100.00 → $100.00 (+0.00)
+- **realized** $0.00 after $0.10 of fees
+- **signals** 0 seen, 0 copied, 0 skipped
+- **positions** 0 closed, 1 open
+
+**Attention**
+- 1 position(s) are still open and NO STOP-LOSS IS RUNNING ON THEM. The CLOB has no stop order type, so a stop is a price this process watches; while nothing is running, nothing is watching. Either start a run to manage them or close them by hand.
+
+**By trader archetype** — `unknown` 1 pos $0.00
+
+**Next steps**
+1. Decide about the open positions first: run the task to resume managing them, or flatten them by hand. Nothing is watching them meanwhile.
+
+## 2026-09-09 10:58 UTC — task `alpha` (run 1)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 10:58 → 2026-09-09 10:58
+- **equity** $100.00 → $100.00 (+0.00)
+- **realized** $0.00 after $0.10 of fees
+- **signals** 0 seen, 0 copied, 0 skipped
+- **positions** 0 closed, 1 open
+
+**Attention**
+- 1 position(s) are still open and NO STOP-LOSS IS RUNNING ON THEM. The CLOB has no stop order type, so a stop is a price this process watches; while nothing is running, nothing is watching. Either start a run to manage them or close them by hand.
+
+**By trader archetype** — `unknown` 1 pos $0.00
+
+**Next steps**
+1. Decide about the open positions first: run the task to resume managing them, or flatten them by hand. Nothing is watching them meanwhile.
+
+## 2026-09-09 10:57 UTC — task `alpha` (run 1)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 10:57 → 2026-09-09 10:57
+- **equity** $100.00 → $100.00 (+0.00)
+- **realized** $0.00 after $0.10 of fees
+- **signals** 0 seen, 0 copied, 0 skipped
+- **positions** 0 closed, 1 open
+
+**Attention**
+- 1 position(s) are still open and NO STOP-LOSS IS RUNNING ON THEM. The CLOB has no stop order type, so a stop is a price this process watches; while nothing is running, nothing is watching. Either start a run to manage them or close them by hand.
+
+**By trader archetype** — `unknown` 1 pos $0.00
+
+**Next steps**
+1. Decide about the open positions first: run the task to resume managing them, or flatten them by hand. Nothing is watching them meanwhile.
+
+## 2026-09-09 10:57 UTC — task `alpha` (run 1)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 10:57 → 2026-09-09 10:57
+- **equity** $100.00 → $100.00 (+0.00)
+- **realized** $0.00 after $0.10 of fees
+- **signals** 0 seen, 0 copied, 0 skipped
+- **positions** 0 closed, 1 open
+
+**Attention**
+- 1 position(s) are still open and NO STOP-LOSS IS RUNNING ON THEM. The CLOB has no stop order type, so a stop is a price this process watches; while nothing is running, nothing is watching. Either start a run to manage them or close them by hand.
+
+**By trader archetype** — `unknown` 1 pos $0.00
+
+**Next steps**
+1. Decide about the open positions first: run the task to resume managing them, or flatten them by hand. Nothing is watching them meanwhile.
+
+## 2026-09-09 10:56 UTC — task `alpha` (run 1)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 10:56 → 2026-09-09 10:56
+- **equity** $100.00 → $100.00 (+0.00)
+- **realized** $0.00 after $0.10 of fees
+- **signals** 0 seen, 0 copied, 0 skipped
+- **positions** 0 closed, 1 open
+
+**Attention**
+- 1 position(s) are still open and NO STOP-LOSS IS RUNNING ON THEM. The CLOB has no stop order type, so a stop is a price this process watches; while nothing is running, nothing is watching. Either start a run to manage them or close them by hand.
+
+**By trader archetype** — `unknown` 1 pos $0.00
+
+**Next steps**
+1. Decide about the open positions first: run the task to resume managing them, or flatten them by hand. Nothing is watching them meanwhile.
+
+## 2026-09-09 10:55 UTC — task `sim1` (run 79)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 10:46 → 2026-09-09 10:55
+- **equity** $100.00 → $101.36 (+1.36)
+- **realized** $1.36 after $0.64 of fees
+- **signals** 17 seen, 3 copied, 14 skipped
+- **positions** 2 closed, 0 open
+- **latency** median 11s behind the trader, feed 21.3s vs loop 0.2s
+
+**Why copies were refused** — `not_held` 8, `wide_spread` 3, `price_band` 3
+
+**How positions closed** — `session_end` 2 ($1.36)
+
+**By trader archetype** — `resolution-holder` 1 pos $2.23, `market-maker` 1 pos $-0.87
+
+**By trader** — `0x67ac9e1a` $2.23, `0x1dda11b6` $0.00, `0x5a218c7a` $-0.87
+
+**Note** — first end-to-end sim after phase 6/7
+
+**Next steps**
+1. Nothing outstanding. Run `polywatch strategy learn` to fold this session into the record, then start the next run.
+
+## 2026-09-09 10:53 UTC — task `alpha` (run 1)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 10:53 → 2026-09-09 10:53
+- **equity** $100.00 → $100.00 (+0.00)
+- **realized** $0.00 after $0.10 of fees
+- **signals** 0 seen, 0 copied, 0 skipped
+- **positions** 0 closed, 1 open
+
+**Attention**
+- 1 position(s) are still open and NO STOP-LOSS IS RUNNING ON THEM. The CLOB has no stop order type, so a stop is a price this process watches; while nothing is running, nothing is watching. Either start a run to manage them or close them by hand.
+
+**By trader archetype** — `unknown` 1 pos $0.00
+
+**Next steps**
+1. Decide about the open positions first: run the task to resume managing them, or flatten them by hand. Nothing is watching them meanwhile.
+
+## 2026-09-09 10:51 UTC — task `alpha` (run 1)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 10:51 → 2026-09-09 10:51
+- **equity** $100.00 → $100.00 (+0.00)
+- **realized** $0.00 after $0.10 of fees
+- **signals** 0 seen, 0 copied, 0 skipped
+- **positions** 0 closed, 1 open
+
+**Attention**
+- 1 position(s) are still open and NO STOP-LOSS IS RUNNING ON THEM. The CLOB has no stop order type, so a stop is a price this process watches; while nothing is running, nothing is watching. Either start a run to manage them or close them by hand.
+
+**By trader archetype** — `unknown` 1 pos $0.00
+
+**Next steps**
+1. Decide about the open positions first: run the task to resume managing them, or flatten them by hand. Nothing is watching them meanwhile.
+
+## 2026-09-09 10:51 UTC — task `alpha` (run 1)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 10:51 → 2026-09-09 10:51
+- **equity** $100.00 → $100.00 (+0.00)
+- **realized** $0.00 after $0.10 of fees
+- **signals** 0 seen, 0 copied, 0 skipped
+- **positions** 0 closed, 1 open
+
+**Attention**
+- 1 position(s) are still open and NO STOP-LOSS IS RUNNING ON THEM. The CLOB has no stop order type, so a stop is a price this process watches; while nothing is running, nothing is watching. Either start a run to manage them or close them by hand.
+
+**By trader archetype** — `unknown` 1 pos $0.00
+
+**Next steps**
+1. Decide about the open positions first: run the task to resume managing them, or flatten them by hand. Nothing is watching them meanwhile.
+
+## 2026-09-09 10:50 UTC — task `alpha` (run 1)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 10:50 → 2026-09-09 10:50
+- **equity** $100.00 → $100.00 (+0.00)
+- **realized** $0.00 after $0.10 of fees
+- **signals** 0 seen, 0 copied, 0 skipped
+- **positions** 0 closed, 1 open
+
+**Attention**
+- 1 position(s) are still open and NO STOP-LOSS IS RUNNING ON THEM. The CLOB has no stop order type, so a stop is a price this process watches; while nothing is running, nothing is watching. Either start a run to manage them or close them by hand.
+
+**By trader archetype** — `unknown` 1 pos $0.00
+
+**Next steps**
+1. Decide about the open positions first: run the task to resume managing them, or flatten them by hand. Nothing is watching them meanwhile.
+
+## 2026-09-09 10:49 UTC — task `alpha` (run 1)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 10:49 → 2026-09-09 10:49
+- **equity** $100.00 → $100.00 (+0.00)
+- **realized** $0.00 after $0.10 of fees
+- **signals** 0 seen, 0 copied, 0 skipped
+- **positions** 0 closed, 1 open
+
+**Attention**
+- 1 position(s) are still open and NO STOP-LOSS IS RUNNING ON THEM. The CLOB has no stop order type, so a stop is a price this process watches; while nothing is running, nothing is watching. Either start a run to manage them or close them by hand.
+
+**By trader archetype** — `unknown` 1 pos $0.00
+
+**Next steps**
+1. Decide about the open positions first: run the task to resume managing them, or flatten them by hand. Nothing is watching them meanwhile.
+
+## 2026-09-09 10:49 UTC — task `alpha` (run 1)
+
+- **mode** paper · **stopped** session_end · **ran** 2026-09-09 10:49 → 2026-09-09 10:49
+- **equity** $100.00 → $100.00 (+0.00)
+- **realized** $0.00 after $0.10 of fees
+- **signals** 0 seen, 0 copied, 0 skipped
+- **positions** 0 closed, 1 open
+
+**Attention**
+- 1 position(s) are still open and NO STOP-LOSS IS RUNNING ON THEM. The CLOB has no stop order type, so a stop is a price this process watches; while nothing is running, nothing is watching. Either start a run to manage them or close them by hand.
+
+**By trader archetype** — `unknown` 1 pos $0.00
+
+**Next steps**
+1. Decide about the open positions first: run the task to resume managing them, or flatten them by hand. Nothing is watching them meanwhile.
+
 ## 2026-09-09 10:44 UTC — task `alpha` (run 1)
 
 - **mode** paper · **stopped** session_end · **ran** 2026-09-09 10:44 → 2026-09-09 10:44

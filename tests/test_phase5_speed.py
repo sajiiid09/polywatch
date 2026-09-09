@@ -203,6 +203,20 @@ def test_watching_a_new_token_widens_the_subscription():
     assert s._tokens == {"a", "b", "c"}
 
 
+def test_a_deliberate_resubscribe_is_not_reported_as_a_dead_socket():
+    """`watch` closes the socket the reader is blocked on, so the reader wakes with
+    `OSError: Bad file descriptor`. Logging that as "falling back to polling" describes a
+    working resubscribe as a failure, and backing off before reconnecting leaves the position
+    that prompted it unstreamed for exactly as long as the backoff."""
+    said = []
+    s = stream.BookStream(log=said.append)
+    s._thread = object()                      # `watch` only cycles a stream that has started
+    s._tokens = {"a"}
+    s.watch(["b"])
+    assert s._cycling.is_set() and not said
+
+
+
 # --- the engine prefers the stream and falls back without it --------------
 
 

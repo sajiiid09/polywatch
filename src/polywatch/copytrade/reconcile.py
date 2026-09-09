@@ -114,7 +114,10 @@ def resolve(con, run_id: int, executor, remote: dict[str, float] | None
                 f"order {row['id']} ({row['side']}) accepted, outcome never established"))
             continue
 
-        held = store.recorded_shares(con, run_id, row["token_id"])
+        # Every live run's open shares, not just this run's: the account balance covers them
+        # all, and crediting one order with someone else's position is the adoption this
+        # module exists to refuse.
+        held = store.recorded_shares_anywhere(con, row["token_id"])
         surplus = remote.get(row["token_id"], 0.0) - held
         if row["side"] == "BUY" and surplus > SHARE_TOLERANCE:
             resolutions.append(Resolution(row["id"], row["token_id"], row["condition_id"], "BUY",

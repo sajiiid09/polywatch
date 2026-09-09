@@ -373,10 +373,7 @@ def backfill_strategies(con, *, limit: int | None = None, min_trades: int = 20,
     `event-specialist` scores neutral -- reported as missing rather than defaulted, which is why
     a backfilled label can differ from one produced by a full `polywatch trader` pass.
     """
-    addresses = [r[0] for r in con.execute(
-        "SELECT wallet, COUNT(*) c FROM trades GROUP BY wallet HAVING c >= ? "
-        "ORDER BY c DESC" + (" LIMIT ?" if limit else ""),
-        (min_trades, limit) if limit else (min_trades,))]
+    addresses = store.wallets_by_trade_count(con, min_trades, limit)
     price_at = lambda tok, ts: store.price_at(con, tok, ts)          # noqa: E731
     now = int(time.time())
     done = 0

@@ -91,8 +91,8 @@ def account_state(con, task: str, run_id: int | None = None) -> dict:
     Deliberately reads the *database* rather than an engine, so it works identically after a
     clean stop, after a crash, and hours later from a different process.
     """
-    run = (con.execute("SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
-           if run_id is not None else store.last_run(con, task))
+    run = (store.get_run(con, run_id) if run_id is not None
+           else store.last_run(con, task))
     state: dict = {"task": task, "run_id": run["id"] if run else None,
                    "mode": run["mode"] if run else None}
     if run is None:

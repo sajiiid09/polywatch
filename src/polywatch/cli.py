@@ -15,10 +15,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime, timezone
 
 from . import ingest
-from .config import DB_PATH, DEFAULT_BANKROLL_USD, MAX_RPS
+from .config import DB_PATH, DEFAULT_BANKROLL_USD, ENV_FUNDER, MAX_RPS
 from .copytrade import task as task_mod
 from .db import store
 from .screen import Thresholds, screen as run_screen
@@ -45,6 +46,14 @@ def _ts(s: str) -> int:
 
 
 def main(argv=None) -> int:
+    # A run's log is the only thing watching a live session from outside the process, and Python
+    # block-buffers stdout the moment it is not a terminal -- so `task run ... | tee run.log`
+    # showed nothing for the first 8 KB, which for a quiet session is the entire run. An operator
+    # tailing a log to decide whether to intervene needs the line when it happens, not later.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):          # a stdout that cannot be reconfigured
+        pass
     p = argparse.ArgumentParser(prog="polywatch", description="Read-only Polymarket wallet analytics")
     p.add_argument("--db", default=str(DB_PATH))
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -110,6 +119,18 @@ def main(argv=None) -> int:
                     help="skip the copy-lag replay and the price backfill it needs")
     tr.add_argument("--json", action="store_true")
 
+
+    ac = sub.add_parser("account", help="what the exchange thinks this account holds")
+    ac.add_argument("address", nargs="?", default=None,
+                    help=f"defaults to ${ENV_FUNDER}; unauthenticated either way")
+    ac.add_argument("--activity", type=int, default=10, help="recent activity rows to show")
+    ac.add_argument("--limit", type=int, default=20,
+                    help="open positions to print, largest first; 0 for all")
+    ac.add_argument("--live-check", action="store_true",
+                    help="check the live-trading setup -- keys, wallet type, CLOB auth -- "
+                         "without placing an order")
+    ac.add_argument("--rps", type=float, default=MAX_RPS)
+    ac.add_argument("--json", action="store_true")
 
     tk = sub.add_parser("task", help="create and run a copy-trading task")
     tsub = tk.add_subparsers(dest="task_cmd", required=True)
@@ -262,7 +283,9 @@ def main(argv=None) -> int:
     if args.cmd == "screen":
         con = store.connect(args.db)
         store.init_db(con)
-        results = run_screen(con, _thresholds(args))
+        results = run_screen(store.wallets_by_rank(con),
+                             lambda a: store.screening_trades(con, a),
+                             _thresholds(args))
         hdr = f"{'address':14} {'user':16} {'trd':>5} {'t/day':>7} {'gap_s':>8} {'burst':>6} " \
               f"{'days':>5} {'ratio':>6} {'mkts':>5} {'vol':>12} {'ok':>3}"
         print(hdr)
@@ -340,10 +363,8 @@ def main(argv=None) -> int:
                                  "edge_half_life_s": res.edge_half_life_s}
             print(json.dumps(out, indent=2))
             return 0
-        row = con.execute("SELECT username FROM wallets WHERE address=?",
-                          (args.address.lower(),)).fetchone()
         print()
-        print(discover.format_score(sc, est, row["username"] if row else None,
+        print(discover.format_score(sc, est, store.wallet_username(con, args.address),
                                     strategy_row=strat))
         if res is not None:
             print()
@@ -352,6 +373,32 @@ def main(argv=None) -> int:
             print("\n  no settled positions -- nothing to judge this wallet on")
         return 0
 
+
+    if args.cmd == "account":
+        from . import account as account_mod
+        from .fetch.client import Client
+        if args.live_check:
+            rows = account_mod.live_preflight()
+            if args.json:
+                print(json.dumps([{"check": n, "ok": ok, "detail": d} for n, ok, d in rows],
+                                 indent=2))
+            else:
+                print()
+                print(account_mod.format_preflight(rows))
+            return 0 if all(ok for _, ok, _ in rows) else 1
+        try:
+            addr = account_mod.resolve_address(args.address)
+        except RuntimeError as e:
+            print(e)
+            return 1
+        snap = account_mod.snapshot(Client(con=None, rps=args.rps, dump_raw=False),
+                                    addr, activity_limit=args.activity)
+        if args.json:
+            print(json.dumps(snap, indent=2))
+            return 0
+        print()
+        print(account_mod.format_snapshot(snap, limit=args.limit))
+        return 0
 
     if args.cmd == "task":
         from .copytrade import commands

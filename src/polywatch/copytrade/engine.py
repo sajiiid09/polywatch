@@ -696,7 +696,7 @@ class Engine:
             self.cancel_resting(pos_id, "reprice")
         if self.stream is not None:
             self.stream.watch([ev["token_id"]])
-        pos = self.con.execute("SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
+        pos = store.get_position(self.con, pos_id)
         self.log(f"  + buy {fill.shares:.1f} @ {fill.avg_price:.3f} "
                  f"(${fill.cost:.2f} + ${fill.fee:.2f} fee)  {ev.get('title') or ''}"[:110])
         if t.resting_tp:
@@ -755,7 +755,7 @@ class Engine:
         if book is None:
             return None
         self.cancel_resting(pos["id"], reason)
-        pos = self.con.execute("SELECT * FROM positions WHERE id=?", (pos["id"],)).fetchone()
+        pos = store.get_position(self.con, pos["id"])
         want = pos["shares"] if shares is None else min(shares, pos["shares"])
         if want <= 0:
             return None
@@ -830,7 +830,12 @@ class Engine:
             meta = self.market_meta(pos["condition_id"])
             rate = self.fee_rate(meta)
 
-            if self.check_resting(pos, book, rate):
+            # A resting order that filled in pieces leaves a *smaller* position behind, so the
+            # ladder below has to run on the row as it now is. Judging the remainder against the
+            # cost basis of shares that have already been sold prices the stop off a position
+            # that no longer exists.
+            pos = self.check_resting(pos, book, rate)
+            if pos is None:
                 continue
 
             m = exits.mark(pos, book, rate)
@@ -846,8 +851,9 @@ class Engine:
                 marks.pop(pos["id"], None)
         s.marks, s.marks_tick = marks, s.polls
 
-    def check_resting(self, pos, book: dict, rate: float) -> bool:
-        """Did a resting take-profit fill? Returns True when the position is now closed.
+    def check_resting(self, pos, book: dict, rate: float):
+        """Settle whatever a resting take-profit has filled. Returns the position as it now
+        stands, or None once it is closed.
 
         A resting order can fill in pieces, and a piece is not a settlement: the order stays on
         the book for the remainder and only its `filled_shares` moves.
@@ -856,17 +862,24 @@ class Engine:
             fill = self.ex.resting_fill(dict(row), book, fee_rate=rate)
             if fill is None:
                 continue
-            whole = fill.shares >= row["shares"] - 1e-6
+            # `fill.shares` is what filled *since the last check*; `filled_shares` on the row is
+            # the running total, and it is the running total that decides whether the order is
+            # done. Comparing the increment against the order size instead would leave a fully
+            # filled order marked open, and settling by the total would book the earlier pieces
+            # a second time.
+            done_shares = (row["filled_shares"] or 0.0) + fill.shares
+            whole = done_shares >= row["shares"] - 1e-6
             store.settle_resting(self.con, row["id"], "filled" if whole else "open",
-                                 fill.shares, fill.avg_price,
+                                 done_shares, fill.avg_price,
                                  reason=None if whole else "partially filled")
             self._log_order(None, {"token_id": pos["token_id"],
                                    "condition_id": pos["condition_id"]},
                             "SELL", fill.cost, fill.avg_price, fill, reason=exits.TAKE_PROFIT,
                             trader=pos["trader"])
             self.book_exit(pos, fill, exits.TAKE_PROFIT)
-            return fill.shares >= pos["shares"] - 1e-6
-        return False
+            fresh = store.get_position(self.con, pos["id"])
+            return None if fresh is None or not fresh["open"] else fresh
+        return pos
 
     def unrealized(self) -> float:
         """Mark every open position to the bid side, after fees. Used by the breakers.

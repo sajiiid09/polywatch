@@ -77,6 +77,12 @@ class BookStream:
         self._thread: threading.Thread | None = None
         self._ws = None
         self._stop = threading.Event()
+        # Set while `watch` is deliberately cycling the socket. Without it the reader thread,
+        # which is blocked in recv() on the descriptor `watch` just closed, reports the
+        # resubscribe as `OSError: Bad file descriptor ... falling back to polling` -- an
+        # alarming line for a thing that is working, and a needless backoff wait before the
+        # reconnect that was the entire point of closing it.
+        self._cycling = threading.Event()
         self.updates = 0
         self.connects = 0
         self.pings = 0
@@ -116,6 +122,7 @@ class BookStream:
         self._tokens |= new
         if self._thread is None:
             return
+        self._cycling.set()
         try:
             if self._ws is not None:
                 self._ws.close()      # the run loop reconnects with the wider subscription
@@ -173,13 +180,22 @@ class BookStream:
             except Exception as e:  # noqa: BLE001 - a dead socket is a fallback, not a crash
                 if self._stop.is_set():
                     return
-                self.log(f"  ~ book stream: {type(e).__name__}: {e}; falling back to polling")
+                if not self._cycling.is_set():
+                    self.log(f"  ~ book stream: {type(e).__name__}: {e}; "
+                             f"falling back to polling")
             finally:
                 try:
                     if self._ws is not None:
                         self._ws.close()
                 except Exception:  # noqa: BLE001
                     pass
+            if self._cycling.is_set():
+                # Our own resubscribe. Reconnect at once rather than backing off: the position
+                # that prompted it is open and unstreamed until we do, and the interval between
+                # book checks is the resolution of its stop-loss.
+                self._cycling.clear()
+                delay = RECONNECT_BASE_S
+                continue
             if self._stop.wait(delay):
                 return
             delay = min(RECONNECT_CAP_S, delay * 2)

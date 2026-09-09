@@ -2,7 +2,7 @@
 
 **This file is generated. Do not edit it — `polywatch strategy learn` overwrites it whole.**
 
-Generated 2026-09-09 10:38 UTC over all tasks: 78 run(s) between 2026-05-09 23:12 and 2026-09-06 07:53.
+Generated 2026-09-09 11:04 UTC over all tasks: 80 run(s) between 2026-05-09 23:12 and 2026-09-09 10:57.
 
 `STRATEGY.md` is the hand-written thesis and nothing here edits it. This document is the evidence accumulating underneath it: what kinds of trader have been copied, what that cost, and what the numbers suggest changing. **Nothing below has been applied.** A proposal is a suggestion with its sample size attached, and `RULES.md` I8 is what keeps it one.
 
@@ -28,10 +28,11 @@ Positions are attributed to the archetype of the trader whose signal opened them
 
 | archetype | positions | closed | open | realized pnl | fees | win rate | top exit |
 |---|---|---|---|---|---|---|---|
-| `resolution-holder` | 1434 | 1434 | 0 | $840.57 | $143.48 | 34% | settled_loss |
+| `resolution-holder` | 1435 | 1435 | 0 | $842.79 | $143.78 | 34% | settled_loss |
 | `longshot-hunter` | 600 | 600 | 0 | $388.13 | $67.90 | 24% | mirror_sell |
-| `unclassified` | 6 | 6 | 0 | $-12.00 | $0.57 | 0% | settled_loss |
+| `market-maker` | 3 | 2 | 1 | $-2.71 | $1.16 | 0% | session_end |
 | `favourite-grinder` | 3 | 3 | 0 | $-12.00 | $0.57 | 0% | settled_loss |
+| `unclassified` | 6 | 6 | 0 | $-12.00 | $0.57 | 0% | settled_loss |
 
 ## Where copies are refused
 
@@ -48,10 +49,14 @@ The skip histogram is the main finding of a paper run. Split by archetype it sto
 | `price_below_momentum_band` | 732 (3%) | `longshot-hunter` (597) |
 | `max_concurrent_positions` | 717 (3%) | `resolution-holder` (585) |
 | `market_unknown` | 387 (1%) | `resolution-holder` (195) |
+| `not_held` | 13 (0%) | `market-maker` (13) |
+| `price_band` | 9 (0%) | `resolution-holder` (5) |
+| `wide_spread` | 4 (0%) | `market-maker` (4) |
+| `below_min_size` | 3 (0%) | `market-maker` (3) |
 
 ## Latency
 
-30681 signals, median 0s behind the trader, p90 0s.
+30715 signals, median 0s behind the trader, p90 0s.
 Split: 0.0s is the feed answering with stale data, 0.0s is this loop. Only the second half is ours to fix.
 
 ## Trend
@@ -90,6 +95,16 @@ Each `strategy learn` appends a row per archetype, so drift is visible rather th
 | 2026-09-09 10:38 | `scalper` | 0 | $0.00 | - |
 | 2026-09-09 10:38 | `unclassified` | 6 | $-12.00 | 0% |
 | 2026-09-09 10:38 | `unknown` | 0 | $0.00 | - |
+| 2026-09-09 11:04 | `event-specialist` | 0 | $0.00 | - |
+| 2026-09-09 11:04 | `fade-the-move` | 0 | $0.00 | - |
+| 2026-09-09 11:04 | `favourite-grinder` | 3 | $-12.00 | 0% |
+| 2026-09-09 11:04 | `longshot-hunter` | 600 | $388.13 | 24% |
+| 2026-09-09 11:04 | `market-maker` | 3 | $-2.71 | 0% |
+| 2026-09-09 11:04 | `momentum-chaser` | 0 | $0.00 | - |
+| 2026-09-09 11:04 | `resolution-holder` | 1435 | $842.79 | 34% |
+| 2026-09-09 11:04 | `scalper` | 0 | $0.00 | - |
+| 2026-09-09 11:04 | `unclassified` | 6 | $-12.00 | 0% |
+| 2026-09-09 11:04 | `unknown` | 0 | $0.00 | - |
 
 ## Proposed changes (UNAPPLIED)
 
@@ -100,7 +115,7 @@ _Nothing has enough evidence behind it to propose. That is the expected state ea
 - `event-specialist`: 7 wallet(s) profiled, none copied yet.
 - `fade-the-move`: 15 wallet(s) profiled, none copied yet.
 - `favourite-grinder`: 3 closed position(s) returning $-12.00. Under the 15-position floor, so this is recorded and not acted on.
-- `market-maker`: 99 wallet(s) profiled, none copied yet.
+- `market-maker`: 2 closed position(s) returning $-2.71. Under the 15-position floor, so this is recorded and not acted on.
 - `momentum-chaser`: 39 wallet(s) profiled, none copied yet.
 - `scalper`: 35 wallet(s) profiled, none copied yet.
 - `unclassified`: 6 closed position(s) returning $-12.00. Under the 15-position floor, so this is recorded and not acted on.

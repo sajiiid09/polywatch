@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 
-from ..config import ENV_FUNDER, ENV_PRIVATE_KEY, MAX_RPS, POLL_TIMEOUT_S
+from ..config import (DEFAULT_SIGNATURE_TYPE, ENV_FUNDER, ENV_PRIVATE_KEY, ENV_SIGNATURE_TYPE,
+                      ENV_UNATTENDED, MAX_RPS, POLL_TIMEOUT_S)
 from ..db import store
 from ..fetch.client import Client
 from . import book as bk
@@ -148,10 +150,12 @@ def _list(con, args) -> int:
     if not rows:
         print("no tasks")
         return 0
-    print(f"{'name':16} {'mode':6} {'trader':14} {'bankroll':>9} {'stake':>8} {'hold':12} runs")
+    # 24, not 16: task names run to 22 characters and the suffix is the part that distinguishes
+    # them, so a narrower column silently prints three different tasks as three identical lines.
+    print(f"{'name':24} {'mode':6} {'trader':14} {'bankroll':>9} {'stake':>8} {'hold':12} runs")
     for r in rows:
-        n = con.execute("SELECT COUNT(*) FROM task_runs WHERE task=?", (r["name"],)).fetchone()[0]
-        print(f"{r['name'][:16]:16} {r['mode']:6} {r['trader'][:14]:14} "
+        n = store.run_count(con, r["name"])
+        print(f"{r['name'][:24]:24} {r['mode']:6} {r['trader'][:14]:14} "
               f"{r['bankroll']:9,.0f} {(r['fixed_usd'] or 0):8,.0f} {r['hold']:12} {n}")
     return 0
 
@@ -173,8 +177,8 @@ def _rm(con, args) -> int:
 
 
 LIVE_WARNING = """
-LIVE MODE. This will sign orders with the key in ${key} and spend real USDC from
-{funder}.
+LIVE MODE. This will sign orders with the key in ${key} ({wallet}) and spend real
+USDC from {funder}.
 
 Before confirming, understand what is and is not protected while it runs:
 
@@ -193,7 +197,11 @@ Most it can spend at once: ${exposure:,.2f} across {n} concurrent positions.
 
 
 def _confirm_live(t: Task) -> bool:
+    sig = os.environ.get(ENV_SIGNATURE_TYPE) or str(DEFAULT_SIGNATURE_TYPE)
+    wallet = {"0": "bare EOA", "1": "email/magic-login proxy wallet",
+              "2": "browser-wallet proxy"}.get(sig, f"signature type {sig}")
     print(LIVE_WARNING.format(key=ENV_PRIVATE_KEY, funder=os.environ.get(ENV_FUNDER, "(unset)"),
+                              wallet=wallet,
                               hours=t.session_hours, loss=t.max_daily_loss_usd,
                               dd=t.max_drawdown_pct, exposure=t.max_market_usd * t.max_concurrent,
                               n=t.max_concurrent))
@@ -211,9 +219,20 @@ def _run(con, args) -> int:
     if args.session_hours is not None:
         t.session_hours = args.session_hours
 
-    if t.mode == "live" and not args.yes and not _confirm_live(t):
-        print("cancelled")
-        return 1
+    if t.mode == "live":
+        # --yes exists so a person who has already read the warning does not have to type LIVE
+        # again. In a cron entry the same flag spends money with nobody watching, and the
+        # difference between the two is not visible from inside this function -- so ask the
+        # environment. A terminal is a person; anything else has to say out loud that it meant
+        # to trade unattended.
+        if args.yes and not sys.stdin.isatty() and os.environ.get(ENV_UNATTENDED) != "1":
+            print(f"refusing --yes live outside a terminal: set {ENV_UNATTENDED}=1 if this "
+                  f"really is meant to trade with nobody watching (the stop-loss only runs "
+                  f"while this process does)")
+            return 1
+        if not args.yes and not _confirm_live(t):
+            print("cancelled")
+            return 1
 
     try:
         ex = execution.make(t.mode)
@@ -435,9 +454,8 @@ def _orders(con, args) -> int:
     These are real orders on a real book in live mode. Listing them is safe; --cancel is not
     reversible, so it says what it did rather than reporting a count.
     """
-    rows = store.orphan_resting(con, mode="live") + [
-        r for r in con.execute(
-            "SELECT * FROM resting_orders WHERE status='open' AND mode='paper'")]
+    rows = store.orphan_resting(con, mode="live") + list(
+        store.resting_by_mode(con, "paper"))
     if not rows:
         print("no resting orders")
         return 0

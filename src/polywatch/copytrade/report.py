@@ -43,7 +43,7 @@ def latency_block(stats: dict, poll_interval_s: float, split: dict | None = None
 
 
 def run_report(con, run_id: int, task=None) -> str:
-    run = con.execute("SELECT * FROM task_runs WHERE id=?", (run_id,)).fetchone()
+    run = store.get_run(con, run_id)
     if run is None:
         raise KeyError(f"no run {run_id}")
     s = store.run_summary(con, run_id)
@@ -79,9 +79,7 @@ def run_report(con, run_id: int, task=None) -> str:
         for reason, n in skips:
             lines.append(f"    {(reason or '?'):<{width}}  {n}")
 
-    closed = con.execute(
-        """SELECT * FROM positions WHERE run_id=? AND open=0 ORDER BY closed_ts""",
-        (run_id,)).fetchall()
+    closed = store.closed_positions_for_run(con, run_id)
     if closed:
         lines += ["", "  closed positions",
                   f"    {'token':<12} {'shares':>8} {'entry':>7} {'pnl':>9} {'held':>7}  why"]
@@ -93,8 +91,7 @@ def run_report(con, run_id: int, task=None) -> str:
 
     lines += trader_block(con, run_id, task)
 
-    rest = con.execute(
-        "SELECT * FROM resting_orders WHERE run_id=? AND status='open'", (run_id,)).fetchall()
+    rest = store.open_resting(con, run_id)
     if rest:
         lines += ["", f"  {len(rest)} resting sell order(s) still on the book:"]
         for r in rest:
@@ -135,8 +132,5 @@ def exit_mix(con, run_id: int) -> list[tuple[str, int, float]]:
     infrequent, max_hold near zero. A run where max_hold dominates is one where the trader's
     edge is slower than the task assumes it is.
     """
-    rows = con.execute(
-        """SELECT close_reason, COUNT(*), COALESCE(SUM(realized_pnl),0) FROM positions
-           WHERE run_id=? AND open=0 GROUP BY close_reason ORDER BY COUNT(*) DESC""",
-        (run_id,)).fetchall()
+    rows = store.close_reason_mix(con, run_id)
     return [(r[0] or exits.SESSION_END, int(r[1]), float(r[2])) for r in rows]

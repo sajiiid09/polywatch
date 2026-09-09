@@ -392,14 +392,25 @@ def test_a_database_from_the_previous_schema_still_opens_and_gains_the_new_colum
     import sqlite3
     import subprocess
 
-    old = subprocess.run(["git", "show", "HEAD:src/polywatch/db/schema.sql"],
-                         capture_output=True, text=True, check=True).stdout
+    # The newest revision of schema.sql that predates these tables, rather than HEAD: once the
+    # change is committed HEAD *is* the new schema, and a fixture built from it silently stops
+    # testing the migration while continuing to pass.
+    revs = subprocess.run(["git", "rev-list", "HEAD", "--", "src/polywatch/db/schema.sql"],
+                          capture_output=True, text=True, check=True).stdout.split()
+    old = None
+    for rev in revs:
+        text = subprocess.run(["git", "show", f"{rev}:src/polywatch/db/schema.sql"],
+                              capture_output=True, text=True, check=True).stdout
+        if "trader_strategy" not in text:
+            old = text
+            break
+    assert old is not None, "no revision of schema.sql predates trader_strategy"
+
     path = tmp_path / "old.db"
     legacy = sqlite3.connect(path)
     legacy.executescript(old)
     legacy.commit()
     legacy.close()
-    assert "trader_strategy" not in old            # the fixture is genuinely a previous schema
 
     con = store.connect(path)
     store.init_db(con)
