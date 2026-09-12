@@ -144,6 +144,22 @@ def test_a_readable_response_reports_what_matched():
     assert LiveExecutor._filled({"size_matched": "12", "amount": "6"}) == (12.0, 6.0)
 
 
+def test_a_price_the_order_could_not_have_got_is_unknown_rather_than_booked():
+    """`makingAmount` is USDC on a buy and shares on a sell, so the same pairing that reads a
+    buy correctly yields exactly 1.0000 on a sell -- a dollar a share, and a profit the run
+    never made. The band between the touch and our own limit is what catches it."""
+    imp = LiveExecutor._implausible
+    assert imp(1.0, side="SELL", limit=0.50, touch=0.52)          # the misread
+    assert not imp(0.52, side="SELL", limit=0.50, touch=0.52)     # sold at the touch
+    assert not imp(0.51, side="SELL", limit=0.50, touch=0.52)     # walked one level down
+    assert imp(0.40, side="SELL", limit=0.50, touch=0.52)         # below our own limit
+    assert imp(0.0, side="BUY", limit=0.55, touch=0.51)
+    assert imp(0.90, side="BUY", limit=0.55, touch=0.51)          # worse than we signed for
+    assert not imp(0.53, side="BUY", limit=0.55, touch=0.51)
+    # A book that cannot say where the touch was still bounds the fill by the limit.
+    assert not imp(0.51, side="SELL", limit=0.50, touch=None)
+
+
 def test_an_unknown_fill_is_not_ok_and_says_so():
     f = Fill("unknown", reason="the response did not say what matched")
     assert not f.ok and f.unknown
@@ -225,6 +241,22 @@ def test_an_unknown_order_is_settled_by_the_account_when_the_exchange_will_not_t
     assert problems == []
     assert resolutions[0].source == "account_diff"
     assert resolutions[0].shares == pytest.approx(19.0)
+
+
+def test_a_surplus_that_belongs_to_an_earlier_run_is_not_adopted(con):
+    """The exchange answers for the account, not for one run. Yesterday's still-open position
+    is not this order's fill, and crediting it books the same shares to two runs."""
+    store.upsert_task(con, Task(name="t", trader="0xt", bankroll=100.0).as_row())
+    old_run = store.start_run(con, "t", "live", 100.0)
+    a_position(con, old_run, shares=19.0)
+    run = store.start_run(con, "t", "live", 100.0)
+    an_unknown_order(con, run)
+
+    # The account shows exactly the 19 shares the earlier run already holds, and nothing more.
+    resolutions, problems = reconcile.check(con, run, FakeLive(positions={"tok": 19.0}))
+    assert [r.source for r in resolutions] == ["nothing_matched"]
+    assert resolutions[0].shares == 0.0
+    assert [p.kind for p in problems] == []
 
 
 def test_two_unknown_orders_and_one_surplus_is_a_guess_and_is_refused(con):

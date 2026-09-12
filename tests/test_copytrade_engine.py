@@ -178,6 +178,20 @@ def test_a_resting_sell_fills_only_for_as_much_as_the_bids_will_buy():
     assert fill.shares == pytest.approx(10) and fill.cost == pytest.approx(6)
 
 
+def test_a_partly_filled_resting_sell_only_offers_the_remainder_next_time():
+    """The order size never changes; `filled_shares` is what has already been booked.
+
+    Walking the original size again on the next tick books the first piece a second time, and
+    the exit that carries most of a run's PnL is exactly the one that would be inflated by it.
+    """
+    ex = PaperExecutor()
+    order = {"price": 0.60, "shares": 100, "filled_shares": 40}
+    fill = ex.resting_fill(order, book_of([(0.60, 1000)], []), fee_rate=0.0)
+    assert fill.shares == pytest.approx(60)
+    order["filled_shares"] = 100
+    assert ex.resting_fill(order, book_of([(0.60, 1000)], []), fee_rate=0.0) is None
+
+
 def test_a_resting_sell_fills_whole_when_there_is_depth_to_fill_it():
     ex = PaperExecutor()
     order = {"price": 0.60, "shares": 100}
@@ -317,6 +331,32 @@ def test_the_resting_take_profit_closes_the_position_when_the_bid_reaches_it(con
     assert not store.open_positions(con, eng.state.run_id)
     closed = con.execute("SELECT * FROM positions WHERE open=0").fetchone()
     assert closed["close_reason"] == exits.TAKE_PROFIT and closed["realized_pnl"] > 0
+
+
+def test_a_resting_take_profit_filling_in_pieces_sells_the_position_once(con):
+    """Two ticks, a thin bid each time. The position must sell its shares once in total, not
+    once per tick: `check_resting` settles by the increment, and the running total is what
+    decides the order is done."""
+    books = {"tok": {"bids": [(0.49, 1000)], "asks": [(0.51, 1000)]}}
+    t = Task(name="t", trader="0xtrader", tp_kind="pct", tp_value=0.10, resting_tp=True)
+    eng, fake = engine_for(con, [activity_event()], books, task=t)
+    eng.poll_signals()
+    pos = store.open_positions(con, eng.state.run_id)[0]
+    half = pos["shares"] / 2
+
+    fake.books["tok"] = {"bids": [(0.70, half)], "asks": [(0.71, 1000)]}
+    eng.manage_positions()
+    rest = store.open_resting(con, eng.state.run_id)
+    assert len(rest) == 1 and rest[0]["filled_shares"] == pytest.approx(half)
+    assert store.open_positions(con, eng.state.run_id)[0]["shares"] == pytest.approx(half)
+
+    fake.books["tok"] = {"bids": [(0.70, 1000)], "asks": [(0.71, 1000)]}
+    eng.manage_positions()
+    assert not store.open_positions(con, eng.state.run_id)
+    assert not store.open_resting(con, eng.state.run_id)
+    sold = con.execute(
+        "SELECT COALESCE(SUM(filled_shares),0) FROM orders WHERE side='SELL'").fetchone()[0]
+    assert sold == pytest.approx(pos["shares"])
 
 
 def test_a_collapsing_price_trips_the_stop_and_the_loss_is_bounded(con):

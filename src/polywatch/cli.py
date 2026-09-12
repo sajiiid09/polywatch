@@ -15,10 +15,12 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime, timezone
 
 from . import ingest
-from .config import DB_PATH, DEFAULT_BANKROLL_USD, MAX_RPS
+from .config import (DB_PATH, DEFAULT_BANKROLL_USD, DEFAULT_STAKE_USD, ENV_FUNDER,
+                     MAX_RPS)
 from .copytrade import task as task_mod
 from .db import store
 from .screen import Thresholds, screen as run_screen
@@ -45,6 +47,14 @@ def _ts(s: str) -> int:
 
 
 def main(argv=None) -> int:
+    # A run's log is the only thing watching a live session from outside the process, and Python
+    # block-buffers stdout the moment it is not a terminal -- so `task run ... | tee run.log`
+    # showed nothing for the first 8 KB, which for a quiet session is the entire run. An operator
+    # tailing a log to decide whether to intervene needs the line when it happens, not later.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):          # a stdout that cannot be reconfigured
+        pass
     p = argparse.ArgumentParser(prog="polywatch", description="Read-only Polymarket wallet analytics")
     p.add_argument("--db", default=str(DB_PATH))
     sub = p.add_subparsers(dest="cmd", required=True)
@@ -95,6 +105,13 @@ def main(argv=None) -> int:
                          "inferred from holding period rather than measured")
     dc.add_argument("--include-excluded", action="store_true",
                     help="also show wallets that failed a hard gate, and why")
+    dc.add_argument("--archetype", action="append", default=None,
+                    help="only wallets classified as this; repeat for several. "
+                         "scalper, momentum-chaser, event-specialist and fade-the-move "
+                         "are the quick-swing kinds; resolution-holder is not")
+    dc.add_argument("--max-hold-hours", type=float, default=None,
+                    help="only wallets whose median hold is under this, whatever they "
+                         "are labelled -- a slow wallet produces no flips to copy")
     dc.add_argument("--rps", type=float, default=MAX_RPS)
     dc.add_argument("--json", action="store_true")
     for name, default, helptext in _THRESHOLD_FLAGS:
@@ -111,6 +128,18 @@ def main(argv=None) -> int:
     tr.add_argument("--json", action="store_true")
 
 
+    ac = sub.add_parser("account", help="what the exchange thinks this account holds")
+    ac.add_argument("address", nargs="?", default=None,
+                    help=f"defaults to ${ENV_FUNDER}; unauthenticated either way")
+    ac.add_argument("--activity", type=int, default=10, help="recent activity rows to show")
+    ac.add_argument("--limit", type=int, default=20,
+                    help="open positions to print, largest first; 0 for all")
+    ac.add_argument("--live-check", action="store_true",
+                    help="check the live-trading setup -- keys, wallet type, CLOB auth -- "
+                         "without placing an order")
+    ac.add_argument("--rps", type=float, default=MAX_RPS)
+    ac.add_argument("--json", action="store_true")
+
     tk = sub.add_parser("task", help="create and run a copy-trading task")
     tsub = tk.add_subparsers(dest="task_cmd", required=True)
 
@@ -123,6 +152,14 @@ def main(argv=None) -> int:
                          "them; excluded wallets are never chosen")
     tc.add_argument("--min-rank-score", type=float, default=None,
                     help="floor on rank_score when building a roster from the shortlist")
+    tc.add_argument("--archetype", action="append", default=None,
+                    help="only wallets classified as this; repeat for several. "
+                         "scalper, momentum-chaser, event-specialist and fade-the-move "
+                         "are the quick-swing kinds; resolution-holder is not")
+    tc.add_argument("--max-hold-hours", type=float, default=None,
+                    help="only wallets whose median hold is under this, whatever they "
+                         "are labelled -- a slow wallet produces no flips to copy")
+
     tc.add_argument("--per-trader-usd", type=float, default=None,
                     help="cap on what one trader's signals may have at risk; defaults to an "
                          "equal share of the bankroll")
@@ -132,7 +169,8 @@ def main(argv=None) -> int:
                     help="quick_flips is what the poller is tuned for; hours loosens the "
                          "exits for an idea you intend to babysit yourself")
     tc.add_argument("--bankroll", type=float, default=DEFAULT_BANKROLL_USD)
-    tc.add_argument("--stake", type=float, default=10.0, help="USD per copied trade (fixed)")
+    tc.add_argument("--stake", type=float, default=DEFAULT_STAKE_USD,
+                    help="USD per copied trade (fixed)")
     tc.add_argument("--mirror", action="store_true",
                     help="size as a fraction of their account instead of a fixed stake")
     tc.add_argument("--max-market-usd", type=float, default=None)
@@ -187,6 +225,13 @@ def main(argv=None) -> int:
                           "optional `stream` extra")
     trn.add_argument("--no-stream", action="store_true",
                      help="poll for books even when streaming is available")
+    trn.add_argument("--chain", action="store_true",
+                     help="detect the copied wallets' fills from Polygon rather than waiting "
+                          "for data-api to index them; measured at 13-21s of the copy latency, "
+                          "against 0.0-0.4s for the loop itself. On by default; needs the "
+                          "optional `stream` extra")
+    trn.add_argument("--no-chain", action="store_true",
+                     help="detect fills only from the /activity poll, at its ~15s cache floor")
     # A run ends by recording what it did and what is left for whoever is next. On by default:
     # the sessions worth handing over are the ones nobody remembered to log.
     trn.add_argument("--no-session-log", action="store_true",
@@ -262,7 +307,9 @@ def main(argv=None) -> int:
     if args.cmd == "screen":
         con = store.connect(args.db)
         store.init_db(con)
-        results = run_screen(con, _thresholds(args))
+        results = run_screen(store.wallets_by_rank(con),
+                             lambda a: store.screening_trades(con, a),
+                             _thresholds(args))
         hdr = f"{'address':14} {'user':16} {'trd':>5} {'t/day':>7} {'gap_s':>8} {'burst':>6} " \
               f"{'days':>5} {'ratio':>6} {'mkts':>5} {'vol':>12} {'ok':>3}"
         print(hdr)
@@ -311,8 +358,10 @@ def main(argv=None) -> int:
                      with_replay=not args.no_replay,
                      categories=[c.upper() for c in args.category] if args.category else None,
                      thresholds=_thresholds(args), max_candidates=args.candidates)
-        rows = store.top_trader_scores(con, limit=args.limit,
-                                       include_excluded=args.include_excluded)
+        rows = store.top_trader_scores(
+            con, limit=args.limit, include_excluded=args.include_excluded,
+            archetypes=args.archetype,
+            max_hold_s=int(args.max_hold_hours * 3600) if args.max_hold_hours else None)
         if args.json:
             print(json.dumps([dict(r) for r in rows], indent=2))
             return 0
@@ -340,10 +389,8 @@ def main(argv=None) -> int:
                                  "edge_half_life_s": res.edge_half_life_s}
             print(json.dumps(out, indent=2))
             return 0
-        row = con.execute("SELECT username FROM wallets WHERE address=?",
-                          (args.address.lower(),)).fetchone()
         print()
-        print(discover.format_score(sc, est, row["username"] if row else None,
+        print(discover.format_score(sc, est, store.wallet_username(con, args.address),
                                     strategy_row=strat))
         if res is not None:
             print()
@@ -352,6 +399,32 @@ def main(argv=None) -> int:
             print("\n  no settled positions -- nothing to judge this wallet on")
         return 0
 
+
+    if args.cmd == "account":
+        from . import account as account_mod
+        from .fetch.client import Client
+        if args.live_check:
+            rows = account_mod.live_preflight()
+            if args.json:
+                print(json.dumps([{"check": n, "ok": ok, "detail": d} for n, ok, d in rows],
+                                 indent=2))
+            else:
+                print()
+                print(account_mod.format_preflight(rows))
+            return 0 if all(ok for _, ok, _ in rows) else 1
+        try:
+            addr = account_mod.resolve_address(args.address)
+        except RuntimeError as e:
+            print(e)
+            return 1
+        snap = account_mod.snapshot(Client(con=None, rps=args.rps, dump_raw=False),
+                                    addr, activity_limit=args.activity)
+        if args.json:
+            print(json.dumps(snap, indent=2))
+            return 0
+        print()
+        print(account_mod.format_snapshot(snap, limit=args.limit))
+        return 0
 
     if args.cmd == "task":
         from .copytrade import commands

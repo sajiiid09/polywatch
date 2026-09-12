@@ -1,0 +1,43 @@
+run 82  task swing1  mode PAPER
+  traders       4, up to $25.00 each
+                0xb4cecbca7b4a1b2b08f7284027c914f00fae49e0
+                0x0786dae11f63aa97035bd5facdb1168624c1df1d
+                0x4e3de51057ed8c345ff6f5af6534c385927b8554
+                0xd27cc742d023d06ef633a4c880cf1ff1836ec081
+  bankroll      $100.00   stake fixed $5.00   max/market $25.00
+  poll          3s   signals older than 45s are skipped as stale
+  session       8.0h, then flatten
+  stop-loss     -15% off entry   take-profit none -- exits follow the trader, the trail and the stop
+  trailing      6%   max hold 45m   follow trader's exits: yes
+  breakers      -$20.00 or -25%
+
+  exits         checked on every book update (streamed)
+
+  The stop-loss is enforced by this process. The exchange has no stop order type,
+  so while the bot is not running, the stop is not running. The take-profit, if it
+  is a resting order, does not depend on the bot at all.
+  ~ book stream: BrokenPipeError: [Errno 32] Broken pipe; falling back to polling
+  + buy 6.6 @ 0.760 ($5.00 + $0.08 fee)  LoL: Maryville University vs NRG Esports (BO5) - North American Chall
+  + buy 6.6 @ 0.760 ($5.00 + $0.08 fee)  LoL: Maryville University vs NRG Esports (BO5) - North American Chall
+  + buy 6.6 @ 0.760 ($5.00 + $0.08 fee)  LoL: Maryville University vs NRG Esports (BO5) - North American Chall
+  + buy 6.6 @ 0.760 ($5.00 + $0.08 fee)  LoL: Maryville University vs NRG Esports (BO5) - North American Chall
+
+  stopping after this tick (again to force)
+  - sell 26.3 @ 0.750  session_end  pnl $-0.91
+
+run 82  task swing1  PAPER
+  started        2026-09-09 18:10   stopped 2026-09-09 20:23   (stopped)
+  bankroll       $100.00 -> $99.09
+  realized pnl   $-0.91   fees $0.64
+  signals        4 seen, 4 copied, 0 skipped
+  positions      1 closed, 0 still open
+  latency        n=4  p50 9s  p90 26s  p99 26s  max 26s  (poll 3s)
+                 of which  feed 16.5s  loop 0.0s  on average
+                 the feed is the bottleneck, not the loop -- a shorter poll interval will not help
+  fee drag       $0.64 on $-0.26 gross (245% of it)
+  closed positions
+    token          shares   entry       pnl    held  why
+    199292474385     26.3   0.760     -0.91      2m  session_end
+
+  session recorded. next steps:
+    1. Nothing outstanding. Run `polywatch strategy learn` to fold this session into the record, then start the next run.

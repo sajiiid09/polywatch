@@ -24,7 +24,9 @@ of it rather than leaving positions unattended.
 from __future__ import annotations
 
 import signal as _signal
+import threading
 import time
+from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
@@ -43,6 +45,11 @@ from .task import Task
 # How long a cached market_meta row is trusted. `accepting_orders` flips well before a market
 # resolves, and copying into a market that has stopped accepting orders is a guaranteed reject.
 META_TTL_S = 600
+
+# How many handled fills to remember in memory for the duplicate guard. A busy roster produces
+# a few hundred an hour, so this is a whole session with room to spare, for a few tens of
+# kilobytes.
+HANDLED_CAP = 8192
 
 # A resting sell above this never fills often enough to be worth tying the shares up in. The
 # fee floor pushes targets upward at prices near 0.50, and widening one past here means the
@@ -79,6 +86,13 @@ class RunState:
     # position's book to recompute them doubled the request count of every tick.
     marks: dict[int, float] = field(default_factory=dict)
     marks_tick: int = -1
+    # Every (tx_hash, token_id, side, micro-units) this run has already handled, by either
+    # route. The database's UNIQUE constraint is the real dedupe and this does not replace it --
+    # it covers the one gap the constraint cannot: `signals.size` is REAL, the /activity path
+    # reaches it by parsing a decimal string and the chain path by dividing a uint256, and two
+    # floats one ULP apart do not collide. Size is keyed here as an exact integer of micro-units
+    # so that genuinely different partial fills in one transaction still count separately.
+    handled: "OrderedDict[tuple, bool]" = field(default_factory=OrderedDict)
     polls: int = 0
     errors: int = 0
     adopted: int = 0
@@ -88,7 +102,8 @@ class RunState:
 
 class Engine:
     def __init__(self, con, task: Task, executor: Executor, client: Client,
-                 log=print, now=lambda: int(time.time()), stream=None, workers: int = 4):
+                 log=print, now=lambda: int(time.time()), stream=None, workers: int = 4,
+                 trades=None):
         self.con = con
         self.task = task
         self.ex = executor
@@ -97,6 +112,17 @@ class Engine:
         self.now = now
         # A live book feed, or None to fetch every book over HTTP. See copytrade/stream.py.
         self.stream = stream
+        # A live fill feed for the copied wallets, or None to rely on the /activity poll alone.
+        # See copytrade/tradestream.py. Purely an accelerator: the poll runs either way, and
+        # everything this delivers would have arrived on it some thirteen seconds later.
+        self.trades = trades
+        # token id -> (condition_id, outcome, outcome_index), or () for a known miss. The chain
+        # feed names a fill by token id alone and every gate downstream wants the condition id.
+        self._token_markets: dict[str, tuple | None] = {}
+        # Both feeds signal the same Event, so one wait covers a book that moved and a fill that
+        # landed. They each just set whatever is on their `changed` attribute, so handing them a
+        # shared one costs nothing and saves the loop from polling two flags on a timer.
+        self._wake = threading.Event()
         self.workers = workers
         self.state: RunState | None = None
         self._stopping = False
@@ -335,6 +361,7 @@ class Engine:
             while not self._stopping:
                 tick = time.monotonic()
                 try:
+                    self.drain_trades()
                     self.poll_signals()
                     self.manage_positions()
                 except FetchError as e:
@@ -376,10 +403,16 @@ class Engine:
         against us for free.
 
         With a stream, the wait ends early whenever a held book changes, the ladder runs, and
-        the wait resumes for whatever is left of the interval. Signals are still gathered on the
-        poll tick, because a third party's fills cannot be streamed at all.
+        the wait resumes for whatever is left of the interval.
+
+        It also ends early when the chain feed sees one of the copied wallets fill. That
+        sentence used to read "signals are still gathered on the poll tick, because a third
+        party's fills cannot be streamed at all" -- true of Polymarket's websockets, false of
+        the chain underneath them. See copytrade/tradestream.py for the measurements.
         """
-        if self.stream is None or not self.stream.live:
+        self._arm_feeds()
+        live = [f for f in (self.stream, self.trades) if f is not None and f.live]
+        if not live:
             time.sleep(seconds)
             return
         deadline = time.monotonic() + seconds
@@ -387,14 +420,40 @@ class Engine:
             left = deadline - time.monotonic()
             if left <= 0:
                 return
-            if not self.stream.changed.wait(timeout=left):
+            if not self._wake.wait(timeout=left):
                 return
-            self.stream.changed.clear()
+            self._wake.clear()
+            # Entries first. A fill the target just took is perishable in a way an exit check is
+            # not -- the exit ladder is re-run on every book move anyway, while the edge on a
+            # copied entry is measured in tens of seconds and is already partly spent.
+            try:
+                self.drain_trades()
+            except FetchError as e:
+                self.state.errors += 1
+                self.log(f"  ! chain drain failed: {e}")
             try:
                 self.manage_positions()
             except FetchError as e:
                 self.state.errors += 1
                 self.log(f"  ! exit check failed: {e}")
+
+    def _arm_feeds(self) -> None:
+        """Point every attached feed at the one Event this loop waits on.
+
+        Done here rather than once in __init__ because `stream` and `trades` are attributes a
+        caller may legitimately set after the engine is built, and a feed that signals an Event
+        nobody is waiting on is a feed that silently does nothing. Any signal already raised on
+        the feed's own Event is carried across rather than dropped.
+        """
+        for feed in (self.stream, self.trades):
+            if feed is None:
+                continue
+            own = getattr(feed, "changed", None)
+            if own is self._wake:
+                continue
+            if own is not None and own.is_set():
+                self._wake.set()
+            feed.changed = self._wake
 
     def _install_signal_handlers(self) -> None:
         """SIGINT/SIGTERM set a flag rather than raising through the middle of a fill.
@@ -462,6 +521,7 @@ class Engine:
         prev = s.last_seen.get(trader, 0)
         start = max(0, prev - POLL_OVERLAP_S) if prev else None
         events, fetch_ts, truncated = self.read_activity(trader, start)
+        self.note_assets(events)
         if truncated:
             s.errors += 1
             s.truncated_polls += 1
@@ -495,6 +555,8 @@ class Engine:
         """
         s, t = self.state, self.task
         who = (trader or ev.get("wallet") or t.trader).lower()
+        if self._already_handled(ev, who):
+            return False
         if ev["kind"] != "TRADE" or not ev["side"]:
             # SPLIT / MERGE / REDEEM still get recorded: they are how a position can leave the
             # trader's book without a sell, and a report that omits them looks like the trader
@@ -641,6 +703,138 @@ class Engine:
         self.close(held, exits.FOLLOW_EXIT, signal_id=sig_id, shares=shares)
         return True
 
+    # --- the chain feed -----------------------------------------------------------------
+
+    def _already_handled(self, ev: dict, who: str) -> bool:
+        """Have we acted on this exact fill already, by either route?
+
+        The database's UNIQUE constraint on `signals` is still the dedupe of record. This exists
+        because that constraint compares `size` as a REAL, and the same fill now arrives by two
+        paths that compute that float differently. Keyed on exact micro-units so two partial
+        fills of one token in one transaction remain two events.
+        """
+        s = self.state
+        try:
+            units = int(round(float(ev.get("size") or 0.0) * 1_000_000))
+        except (TypeError, ValueError):
+            return False
+        key = (ev.get("tx_hash") or "", ev.get("token_id") or "", ev.get("side") or "",
+               units, who)
+        if not key[0]:
+            return False  # nothing to key on; let the database decide
+        if key in s.handled:
+            return True
+        s.handled[key] = True
+        while len(s.handled) > HANDLED_CAP:
+            s.handled.popitem(last=False)
+        return False
+
+    def resolve_token(self, token_id: str) -> tuple[str, str | None, int | None] | None:
+        """token id -> (condition_id, outcome, outcome_index), from the local index only.
+
+        Deliberately does not fetch. This is called from the chain path, whose entire value is
+        not making a round trip before it acts; a lookup that went to the network on a miss
+        would hand back the latency the path exists to remove. A miss falls through to the
+        /activity poll, which carries the condition id itself.
+        """
+        cached = self._token_markets.get(token_id)
+        if cached is not None:
+            return cached or None
+        found = store.token_market(self.con, token_id)
+        self._token_markets[token_id] = found or ()
+        return found
+
+    def note_assets(self, events: list[dict]) -> None:
+        """Learn token -> market from anything the poll saw, so the chain path can resolve it.
+
+        The index self-heals along exactly the axis that matters: the markets this roster
+        actually trades are the ones it ends up knowing.
+        """
+        rows = [{"token_id": e["token_id"], "condition_id": e["condition_id"],
+                 "outcome": e.get("outcome"), "outcome_index": e.get("outcome_index")}
+                for e in events
+                if e.get("token_id") and e.get("condition_id")
+                and e["token_id"] not in self._token_markets]
+        if not rows:
+            return
+        seen = {}
+        for r in rows:                      # one row per token; a repeat in the page is not an
+            seen[r["token_id"]] = r         # update, and executemany would do it twice
+        try:
+            store.upsert_assets(self.con, list(seen.values()))
+        except Exception as e:  # noqa: BLE001 - a cache that failed to warm is not a run failure
+            self.log(f"  ! asset index update failed: {type(e).__name__}: {e}")
+            return
+        for tid, r in seen.items():
+            self._token_markets[tid] = (r["condition_id"], r.get("outcome"),
+                                        r.get("outcome_index"))
+
+    def warm_assets(self) -> int:
+        """Teach the token->market index what this roster is already in, before the run starts.
+
+        The chain feed names a fill by token id and nothing else, so a fill in a market the
+        index has never seen cannot be gated and falls back to the poll. That is safe but slow,
+        and the fix is cheap: the wallets we copy mostly trade markets they are already in, or
+        were in recently, and both /activity and /positions carry the token and the condition id
+        together. Two requests per trader at startup buys most of the hit rate there is to buy.
+
+        Never fatal. A roster we could not pre-warm is a roster that resolves lazily instead.
+        """
+        rows: list[dict] = []
+        for trader in self.task.traders:
+            for fetch, parse in ((api.activity, records.parse_activity),
+                                 (api.positions, records.parse_positions)):
+                try:
+                    rows.extend(parse(fetch(self.client, trader, dump_raw=False)))
+                except Exception as e:  # noqa: BLE001 - a cold index is not a run failure
+                    self.log(f"  ~ could not pre-warm {trader[:10]} from "
+                             f"{fetch.__name__}: {type(e).__name__}: {e}")
+        before = len(self._token_markets)
+        self.note_assets(rows)
+        learned = len(self._token_markets) - before
+        if learned:
+            self.log(f"  chain feed: {learned} token(s) indexed for instant resolution")
+        return learned
+
+    def drain_trades(self) -> int:
+        """Handle every fill the chain feed has queued. Returns how many we acted on.
+
+        Errors are isolated per event rather than per drain: one undecodable fill must not cost
+        the run the rest of the batch, which is the opposite of the poll's break-on-error, and
+        deliberately so -- the poll has a watermark to protect and this does not.
+        """
+        if self.trades is None:
+            return 0
+        acted = 0
+        for ev in self.trades.drain():
+            if not ev.get("condition_id"):
+                found = self.resolve_token(ev["token_id"])
+                if found is None:
+                    # Not an error, and not a trade we skip forever: the /activity poll carries
+                    # the condition id and will pick this same fill up in a few seconds through
+                    # the ordinary path. Recorded so the skip histogram shows how often the
+                    # chain path is outrunning what the index knows.
+                    self._record(ev, self.now(), "skipped", "token_unresolved",
+                                 ev["ts"], ev["wallet"])
+                    continue
+                ev["condition_id"], ev["outcome"], ev["outcome_index"] = found
+            try:
+                if self.handle_event(ev, self.now(), ev["ts"], trader=ev["wallet"]):
+                    acted += 1
+            except FetchError as e:
+                self.state.errors += 1
+                self.log(f"  ! chain event {str(ev.get('tx_hash'))[:12]}: {e}")
+            except Exception as e:  # noqa: BLE001 - one bad fill must not drop the batch
+                self.state.errors += 1
+                self.log(f"  ! chain event {str(ev.get('tx_hash'))[:12]} failed: "
+                         f"{type(e).__name__}: {e}")
+            else:
+                # The watermark only ever moves forward, exactly as in poll_trader. A chain fill
+                # seen ahead of the poll must not drag it back and re-read handled history.
+                prev = self.state.last_seen.get(ev["wallet"], 0)
+                self.state.last_seen[ev["wallet"]] = max(prev, ev["ts"])
+        return acted
+
     def _record(self, ev: dict, seen_ts: int, action: str, reason: str | None,
                 fetch_ts: int | None = None, trader: str | None = None) -> int | None:
         return store.insert_signal(self.con, {
@@ -650,7 +844,7 @@ class Engine:
             "condition_id": ev["condition_id"], "side": ev["side"] or None,
             "size": ev["size"], "price": ev["price"], "usdc_size": ev["usdc_size"],
             "trader_ts": ev["ts"], "fetch_ts": fetch_ts or seen_ts, "seen_ts": seen_ts,
-            "action": action, "reason": reason,
+            "action": action, "reason": reason, "source": ev.get("source", "activity"),
         })
 
     # --- execution ----------------------------------------------------------------------
@@ -696,7 +890,7 @@ class Engine:
             self.cancel_resting(pos_id, "reprice")
         if self.stream is not None:
             self.stream.watch([ev["token_id"]])
-        pos = self.con.execute("SELECT * FROM positions WHERE id=?", (pos_id,)).fetchone()
+        pos = store.get_position(self.con, pos_id)
         self.log(f"  + buy {fill.shares:.1f} @ {fill.avg_price:.3f} "
                  f"(${fill.cost:.2f} + ${fill.fee:.2f} fee)  {ev.get('title') or ''}"[:110])
         if t.resting_tp:
@@ -755,7 +949,7 @@ class Engine:
         if book is None:
             return None
         self.cancel_resting(pos["id"], reason)
-        pos = self.con.execute("SELECT * FROM positions WHERE id=?", (pos["id"],)).fetchone()
+        pos = store.get_position(self.con, pos["id"])
         want = pos["shares"] if shares is None else min(shares, pos["shares"])
         if want <= 0:
             return None
@@ -830,7 +1024,12 @@ class Engine:
             meta = self.market_meta(pos["condition_id"])
             rate = self.fee_rate(meta)
 
-            if self.check_resting(pos, book, rate):
+            # A resting order that filled in pieces leaves a *smaller* position behind, so the
+            # ladder below has to run on the row as it now is. Judging the remainder against the
+            # cost basis of shares that have already been sold prices the stop off a position
+            # that no longer exists.
+            pos = self.check_resting(pos, book, rate)
+            if pos is None:
                 continue
 
             m = exits.mark(pos, book, rate)
@@ -846,8 +1045,9 @@ class Engine:
                 marks.pop(pos["id"], None)
         s.marks, s.marks_tick = marks, s.polls
 
-    def check_resting(self, pos, book: dict, rate: float) -> bool:
-        """Did a resting take-profit fill? Returns True when the position is now closed.
+    def check_resting(self, pos, book: dict, rate: float):
+        """Settle whatever a resting take-profit has filled. Returns the position as it now
+        stands, or None once it is closed.
 
         A resting order can fill in pieces, and a piece is not a settlement: the order stays on
         the book for the remainder and only its `filled_shares` moves.
@@ -856,17 +1056,24 @@ class Engine:
             fill = self.ex.resting_fill(dict(row), book, fee_rate=rate)
             if fill is None:
                 continue
-            whole = fill.shares >= row["shares"] - 1e-6
+            # `fill.shares` is what filled *since the last check*; `filled_shares` on the row is
+            # the running total, and it is the running total that decides whether the order is
+            # done. Comparing the increment against the order size instead would leave a fully
+            # filled order marked open, and settling by the total would book the earlier pieces
+            # a second time.
+            done_shares = (row["filled_shares"] or 0.0) + fill.shares
+            whole = done_shares >= row["shares"] - 1e-6
             store.settle_resting(self.con, row["id"], "filled" if whole else "open",
-                                 fill.shares, fill.avg_price,
+                                 done_shares, fill.avg_price,
                                  reason=None if whole else "partially filled")
             self._log_order(None, {"token_id": pos["token_id"],
                                    "condition_id": pos["condition_id"]},
                             "SELL", fill.cost, fill.avg_price, fill, reason=exits.TAKE_PROFIT,
                             trader=pos["trader"])
             self.book_exit(pos, fill, exits.TAKE_PROFIT)
-            return fill.shares >= pos["shares"] - 1e-6
-        return False
+            fresh = store.get_position(self.con, pos["id"])
+            return None if fresh is None or not fresh["open"] else fresh
+        return pos
 
     def unrealized(self) -> float:
         """Mark every open position to the bid side, after fees. Used by the breakers.

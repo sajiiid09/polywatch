@@ -9,12 +9,14 @@ from __future__ import annotations
 
 import json
 import os
+import sys
 
-from ..config import ENV_FUNDER, ENV_PRIVATE_KEY, MAX_RPS, POLL_TIMEOUT_S
+from ..config import (DEFAULT_SIGNATURE_TYPE, ENV_FUNDER, ENV_PRIVATE_KEY, ENV_SIGNATURE_TYPE,
+                      ENV_UNATTENDED, MAX_RPS, POLL_TIMEOUT_S)
 from ..db import store
 from ..fetch.client import Client
 from . import book as bk
-from . import execution, learn, report, session, stream
+from . import execution, learn, report, session, stream, tradestream
 from . import discover, strategy as strategy_mod
 from .engine import Engine, ReconcileError
 from .task import PRESETS, Task, preset
@@ -40,7 +42,10 @@ def _roster(con, args) -> list[str]:
     n = getattr(args, "from_shortlist", None)
     if n:
         floor = args.min_rank_score or 0.0
-        rows = store.top_trader_scores(con, limit=n * 3)
+        hold = getattr(args, "max_hold_hours", None)
+        rows = store.top_trader_scores(
+            con, limit=n * 3, archetypes=getattr(args, "archetype", None),
+            max_hold_s=int(hold * 3600) if hold else None)
         picked = [r["address"] for r in rows if (r["rank_score"] or 0.0) >= floor][:n]
         if not picked:
             raise SystemExit(
@@ -140,7 +145,26 @@ def _describe(t: Task) -> str:
         f"{t.max_signal_age_s}s",
         f"  session       {t.session_hours:.1f}h; breakers -${t.max_daily_loss_usd:,.2f} "
         f"or -{t.max_drawdown_pct:.0%}",
+        _breaker_depth(t),
     ] if x)
+
+
+def _breaker_depth(t: Task) -> str:
+    """How many stakes deep the drawdown breaker is, and a warning when that is not many.
+
+    The breaker is a fraction of the bankroll and the stake is a fixed number of dollars, so the
+    two together decide how many losing trades a run survives before it halts itself. Raising
+    the stake without raising the bankroll does not make the run bolder -- it makes it shorter,
+    and a run that halts early never reaches the winners that pay for the losers.
+    """
+    if t.buy_method != "fixed" or not t.fixed_usd:
+        return ""
+    room = min(t.max_daily_loss_usd, t.bankroll * t.max_drawdown_pct)
+    n = room / t.fixed_usd
+    line = (f"  breaker depth ${room:,.2f} of room = {n:.1f} stakes at ${t.fixed_usd:,.2f}")
+    if n < 5:
+        line += f"\n                THIN -- a bad run halts before the strategy gets a sample"
+    return line
 
 
 def _list(con, args) -> int:
@@ -148,10 +172,12 @@ def _list(con, args) -> int:
     if not rows:
         print("no tasks")
         return 0
-    print(f"{'name':16} {'mode':6} {'trader':14} {'bankroll':>9} {'stake':>8} {'hold':12} runs")
+    # 24, not 16: task names run to 22 characters and the suffix is the part that distinguishes
+    # them, so a narrower column silently prints three different tasks as three identical lines.
+    print(f"{'name':24} {'mode':6} {'trader':14} {'bankroll':>9} {'stake':>8} {'hold':12} runs")
     for r in rows:
-        n = con.execute("SELECT COUNT(*) FROM task_runs WHERE task=?", (r["name"],)).fetchone()[0]
-        print(f"{r['name'][:16]:16} {r['mode']:6} {r['trader'][:14]:14} "
+        n = store.run_count(con, r["name"])
+        print(f"{r['name'][:24]:24} {r['mode']:6} {r['trader'][:14]:14} "
               f"{r['bankroll']:9,.0f} {(r['fixed_usd'] or 0):8,.0f} {r['hold']:12} {n}")
     return 0
 
@@ -168,13 +194,17 @@ def _show(con, args) -> int:
 
 
 def _rm(con, args) -> int:
-    print(f"deleted {store.delete_task(con, args.name)} task(s)")
+    try:
+        print(f"deleted {store.delete_task(con, args.name)} task(s)")
+    except ValueError as e:
+        print(e)
+        return 1
     return 0
 
 
 LIVE_WARNING = """
-LIVE MODE. This will sign orders with the key in ${key} and spend real USDC from
-{funder}.
+LIVE MODE. This will sign orders with the key in ${key} ({wallet}) and spend real
+USDC from {funder}.
 
 Before confirming, understand what is and is not protected while it runs:
 
@@ -193,7 +223,11 @@ Most it can spend at once: ${exposure:,.2f} across {n} concurrent positions.
 
 
 def _confirm_live(t: Task) -> bool:
+    sig = os.environ.get(ENV_SIGNATURE_TYPE) or str(DEFAULT_SIGNATURE_TYPE)
+    wallet = {"0": "bare EOA", "1": "email/magic-login proxy wallet",
+              "2": "browser-wallet proxy"}.get(sig, f"signature type {sig}")
     print(LIVE_WARNING.format(key=ENV_PRIVATE_KEY, funder=os.environ.get(ENV_FUNDER, "(unset)"),
+                              wallet=wallet,
                               hours=t.session_hours, loss=t.max_daily_loss_usd,
                               dd=t.max_drawdown_pct, exposure=t.max_market_usd * t.max_concurrent,
                               n=t.max_concurrent))
@@ -211,9 +245,20 @@ def _run(con, args) -> int:
     if args.session_hours is not None:
         t.session_hours = args.session_hours
 
-    if t.mode == "live" and not args.yes and not _confirm_live(t):
-        print("cancelled")
-        return 1
+    if t.mode == "live":
+        # --yes exists so a person who has already read the warning does not have to type LIVE
+        # again. In a cron entry the same flag spends money with nobody watching, and the
+        # difference between the two is not visible from inside this function -- so ask the
+        # environment. A terminal is a person; anything else has to say out loud that it meant
+        # to trade unattended.
+        if args.yes and not sys.stdin.isatty() and os.environ.get(ENV_UNATTENDED) != "1":
+            print(f"refusing --yes live outside a terminal: set {ENV_UNATTENDED}=1 if this "
+                  f"really is meant to trade with nobody watching (the stop-loss only runs "
+                  f"while this process does)")
+            return 1
+        if not args.yes and not _confirm_live(t):
+            print("cancelled")
+            return 1
 
     try:
         ex = execution.make(t.mode)
@@ -236,6 +281,26 @@ def _run(con, args) -> int:
                   "uv pip install 'polywatch[stream]'")
 
     eng = Engine(con, t, ex, client, stream=feed)
+
+    # The chain feed. Started after the engine exists because it needs the engine's local
+    # token->market index to resolve a fill, and started before the run so that a fill taken
+    # during startup is already queued by the time the first tick drains it.
+    chain = None
+    if not args.no_chain:
+        # No resolver is handed to the stream: resolving reads the database, the stream runs on
+        # socket threads, and a sqlite3 connection belongs to the thread that opened it. The
+        # engine already holds that line for its book workers. Fills therefore arrive with an
+        # empty condition_id and `drain_trades` resolves them on the engine's own thread.
+        chain = tradestream.connect(t.traders, log=print)
+        if chain is None and chain_requested(args):
+            print("  chain streaming needs the optional extra: "
+                  "uv pip install 'polywatch[stream]'")
+        elif chain is not None:
+            print(f"  chain feed: watching {len(t.traders)} wallet(s) on "
+                  f"{len(tradestream.CHAIN_WSS)} endpoints; /activity still polling as backup")
+    eng.trades = chain
+    eng.warm_assets()
+
     try:
         summary = eng.run()
     except ReconcileError as e:
@@ -253,6 +318,8 @@ def _run(con, args) -> int:
     finally:
         if feed is not None:
             feed.stop()
+        if chain is not None:
+            chain.stop()
     print()
     print(report.run_report(con, summary["run_id"], t))
     _close_session(con, t.name, summary["run_id"], args)
@@ -398,6 +465,11 @@ def stream_requested(args) -> bool:
     return bool(getattr(args, "stream", False))
 
 
+def chain_requested(args) -> bool:
+    """Did the operator ask for the chain feed explicitly?"""
+    return bool(getattr(args, "chain", False))
+
+
 def _report(con, args) -> int:
     row = store.get_task(con, args.name)
     if row is None:
@@ -435,9 +507,8 @@ def _orders(con, args) -> int:
     These are real orders on a real book in live mode. Listing them is safe; --cancel is not
     reversible, so it says what it did rather than reporting a count.
     """
-    rows = store.orphan_resting(con, mode="live") + [
-        r for r in con.execute(
-            "SELECT * FROM resting_orders WHERE status='open' AND mode='paper'")]
+    rows = store.orphan_resting(con, mode="live") + list(
+        store.resting_by_mode(con, "paper"))
     if not rows:
         print("no resting orders")
         return 0

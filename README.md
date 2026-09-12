@@ -26,6 +26,7 @@ polywatch ingest --wallets 50           # leaderboard -> trades -> markets -> pr
 polywatch screen                        # re-screen with different thresholds
 polywatch discover --limit 20           # sweep, screen, score, replay, rank
 polywatch trader 0xabc...               # one wallet's score card
+polywatch account                       # what the exchange says your own account holds
 
 polywatch task create alpha --trader 0xabc... --stake 10
 polywatch task run alpha                # paper by default
@@ -39,6 +40,38 @@ polywatch strategy learn                # ...and write it to docs/STRATEGY_LEARN
 polywatch session open alpha            # what the last session left you
 polywatch session close alpha           # record this one for whoever is next
 ```
+
+## Going live
+
+Live mode needs the `live` extra, a funded Polymarket account, and four environment variables.
+Credentials are read from the environment only — never a config file, the database, the raw dump
+or a log line.
+
+| Variable | Required | What it is |
+|---|---|---|
+| `POLYMARKET_PRIVATE_KEY` | yes | the EOA key that signs orders |
+| `POLYMARKET_FUNDER` | yes | the proxy address holding the USDC — your Polymarket address |
+| `POLYMARKET_SIGNATURE_TYPE` | no | `1` email/magic login (default), `2` browser wallet, `0` bare EOA |
+| `POLYMARKET_API_KEY` / `_SECRET` / `_PASSPHRASE` | no | derived from the key when unset |
+
+```sh
+set -a; source .env; set +a             # nothing auto-loads .env; it is gitignored
+polywatch account --live-check          # keys, wallet type, CLOB auth — places no order
+```
+
+The preflight authenticates, then reads the account's USDC balance and its exchange allowances.
+A freshly created account has approved nothing, and Polymarket's contracts can only move USDC
+they are approved to move — so the first live order fails on allowance until one trade has been
+placed through the web UI, which sets the approvals as a side effect. The preflight says so
+rather than letting the order find out.
+
+The one thing it cannot check is that `POLYMARKET_SIGNATURE_TYPE` matches how the account was
+created. A mismatch is not dangerous, but every order comes back rejected at the signature check
+without saying why.
+
+`--yes` skips the typed `LIVE` confirmation. Outside a terminal it is refused unless
+`POLYWATCH_UNATTENDED=1` is set as well, because the same flag that saves a person one keystroke
+is, in a cron entry, money moving with nobody watching and no stop-loss running between sessions.
 
 ## Read next
 

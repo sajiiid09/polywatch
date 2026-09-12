@@ -85,11 +85,16 @@ def prices_history(client: Client, token_id: str, start_ts: int, end_ts: int,
 def activity(client: Client, user: str, limit: int = ACTIVITY_PAGE, offset: int = 0,
              kinds: str = "TRADE", start_ts: int | None = None,
              dump_raw: bool | None = None) -> list:
-    """A wallet's activity feed, newest first. The copy-trading poller's only eye.
+    """A wallet's activity feed, newest first. The copy-trading poller's eye, and its backstop.
 
-    This is the sole way to watch someone else's fills. The CLOB market websocket carries no
-    wallet address on its trade events, and the user websocket only ever reports your own
-    account -- so a third party's trades cannot be streamed, only polled. Verified 2026-09-06.
+    This used to say it was "the sole way to watch someone else's fills", on the grounds that the
+    CLOB market websocket carries no wallet address and the user websocket reports only your own
+    account. Both remain true, and both are facts about Polymarket's API rather than about the
+    world: the fills settle on Polygon, where the maker is an indexed topic. See
+    copytrade/tradestream.py and ADR-0008. This endpoint is now the slower of two routes -- it
+    carries a `max-age=15` cache and was measured 13-21s behind -- and is kept because it is the
+    reconciliation source, it carries the non-TRADE event kinds, and it is what the run falls
+    back to when the chain feed cannot connect.
 
     Richer than /trades: it also carries `usdcSize`, the market `title`/`slug`, and the
     non-TRADE event kinds (SPLIT, MERGE, REDEEM, ...) which tell us when a position left the

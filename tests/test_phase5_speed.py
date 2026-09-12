@@ -1,7 +1,8 @@
 """Phase 5: how often the exits are actually checked, and what a tick costs.
 
-Entry latency is bounded by data-api's activity cache and cannot be engineered away. Exit
-latency has no such excuse -- the stop-loss, the trailing stop and the time stop are enforced by
+Entry latency was assumed bounded by data-api's activity cache -- see test_phase9_chain_stream
+for where that turned out to be a fact about Polymarket's API rather than about the world. Exit
+latency never had that excuse -- the stop-loss, the trailing stop and the time stop are enforced by
 this process and by nothing else, so the interval between checks is the resolution of every
 protection a run has.
 """
@@ -201,6 +202,20 @@ def test_watching_a_new_token_widens_the_subscription():
     s._tokens = {"a"}
     s.watch(["b", "c"])
     assert s._tokens == {"a", "b", "c"}
+
+
+def test_a_deliberate_resubscribe_is_not_reported_as_a_dead_socket():
+    """`watch` closes the socket the reader is blocked on, so the reader wakes with
+    `OSError: Bad file descriptor`. Logging that as "falling back to polling" describes a
+    working resubscribe as a failure, and backing off before reconnecting leaves the position
+    that prompted it unstreamed for exactly as long as the backoff."""
+    said = []
+    s = stream.BookStream(log=said.append)
+    s._thread = object()                      # `watch` only cycles a stream that has started
+    s._tokens = {"a"}
+    s.watch(["b"])
+    assert s._cycling.is_set() and not said
+
 
 
 # --- the engine prefers the stream and falls back without it --------------

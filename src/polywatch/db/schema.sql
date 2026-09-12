@@ -195,6 +195,11 @@ CREATE TABLE IF NOT EXISTS signals (
     -- is this loop's. Tuning the poll interval from their sum cannot tell which one moved.
     fetch_ts     INTEGER,                   -- when the response carrying this event landed
     seen_ts      INTEGER NOT NULL,          -- when we acted on it; the difference is copy latency
+    -- Which route saw it first: 'activity' for the data-api poll, 'chain' for the Polygon log
+    -- stream. Recorded because the two have different latency floors -- the poll's is data-api's
+    -- 15-second cache, the chain's is a block -- and a run's blended median moves with the mix
+    -- between them, not only with either one getting faster.
+    source       TEXT,
     action       TEXT NOT NULL,             -- 'copied' | 'skipped'
     reason       TEXT,
     -- One transaction can carry several fills, same as `trades`. This tuple is what makes the
@@ -239,7 +244,10 @@ CREATE TABLE IF NOT EXISTS positions (
     condition_id  TEXT NOT NULL,
     shares        REAL NOT NULL,
     avg_price     REAL NOT NULL,
-    cost_usd      REAL NOT NULL,            -- excludes fees; the two fee columns track those
+    cost_usd      REAL NOT NULL,            -- money tied up; zeroed when the position closes
+    cost_basis    REAL NOT NULL DEFAULT 0,  -- what the entry cost; never cleared, so a closed
+                                            -- trade can still be scored as ROI rather than
+                                            -- only as a dollar figure            -- excludes fees; the two fee columns track those
     -- Entry fees attributable to the shares STILL HELD. Scaled down when part of a position is
     -- sold, so the remainder's cost basis is the cost of the remainder and nothing more.
     fees_paid     REAL NOT NULL DEFAULT 0,

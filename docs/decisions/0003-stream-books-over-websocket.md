@@ -1,6 +1,6 @@
 # 0003 — Stream books over websocket; keep polling for signals
 
-**Date:** 2026-09-09 · **Status:** accepted
+**Date:** 2026-09-09 · **Status:** accepted · **Amended by:** [0008](0008-detect-fills-on-chain-not-from-data-api.md)
 
 ## Context
 
@@ -12,6 +12,12 @@ position's book twice per tick, once in `manage_positions` and again inside `che
 Entry latency is a different problem with a different answer: a third party's fills can only be
 polled. The CLOB market websocket carries no wallet address, and the user websocket reports only
 your own account. That is verified, and it is not fixable.
+
+> **Amended 2026-09-12 by ADR-0008.** The two verified facts above are correct. The conclusion
+> drawn from them is not: it holds for Polymarket's API, not for the Polygon logs the fills
+> settle into, where the maker is an indexed topic. Measured at 11.1s saved at the median over
+> 329 live fills. The decision below stands unchanged — it is about books, and books are still
+> best served by the CLOB socket.
 
 ## Decision
 

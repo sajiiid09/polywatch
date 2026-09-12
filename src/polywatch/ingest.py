@@ -197,7 +197,8 @@ def recon_trades(con: sqlite3.Connection, client: Client, wallets: list[str], si
 
 def apply_screen(con: sqlite3.Connection, th: Thresholds, stats: Stats) -> list[str]:
     """Score every candidate against the thresholds and persist the verdict with its reasons."""
-    results = run_screen(con, th)
+    results = run_screen(store.wallets_by_rank(con),
+                          lambda a: store.screening_trades(con, a), th)
     selected = []
     for profile, ok, fails in results:
         store.set_screen(con, profile.address, ok, "; ".join(fails), json.dumps(profile.as_row()))
@@ -265,7 +266,7 @@ def ingest_markets(con: sqlite3.Connection, client: Client, stats: Stats,
     known = store.known_condition_ids(con)
     todo = sorted(wanted - known)
     if refresh_open:
-        unresolved = {r[0] for r in con.execute("SELECT condition_id FROM markets WHERE resolved=0")}
+        unresolved = store.unresolved_condition_ids(con)
         todo = sorted(set(todo) | (unresolved & wanted))
 
     batches = [todo[i:i + MARKET_BATCH] for i in range(0, len(todo), MARKET_BATCH)]
@@ -318,13 +319,7 @@ def ingest_prices(con: sqlite3.Connection, client: Client, stats: Stats,
     """
     by_token = store.trade_times_by_token(con, selected_only=True)
     if resolved_only:
-        eligible = {
-            r[0] for r in con.execute(
-                """SELECT a.token_id FROM assets a
-                   JOIN markets m ON m.condition_id = a.condition_id
-                   WHERE m.resolved = 1"""
-            )
-        }
+        eligible = store.resolved_token_ids(con)
         by_token = {k: v for k, v in by_token.items() if k in eligible}
 
     covered = store.existing_windows(con)

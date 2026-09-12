@@ -124,18 +124,22 @@ def vol_cap_from(profiles: list[Profile], percentile: float) -> float | None:
     return vols[idx]
 
 
-def screen(con: sqlite3.Connection, th: Thresholds, now: int | None = None
+def screen(wallets, trades_for, th: Thresholds, now: int | None = None
            ) -> list[tuple[Profile, bool, list[str]]]:
-    """Profile every known wallet from the trades already in the DB, then apply thresholds."""
+    """Profile every known wallet, then apply the thresholds to the population.
+
+    The rows and the per-wallet trades are passed in rather than read here, for the same reason
+    `book.py` takes a fee rate and `strategy.py` takes a `price_at`: this module states what a
+    wallet looks like, and a module that states things has no business owning a query. It also
+    makes the population effects -- `vol_cap_from` is a percentile over everyone screened --
+    testable against a list instead of against a database.
+    """
     import time as _t
     now = now or int(_t.time())
     out = []
     profiles = []
-    for row in con.execute("SELECT * FROM wallets ORDER BY rank"):
-        trades = con.execute(
-            "SELECT ts, side, size, condition_id FROM trades WHERE wallet=?", (row["address"],)
-        ).fetchall()
-        profiles.append((row, profile_wallet(row, trades, now)))
+    for row in wallets:
+        profiles.append((row, profile_wallet(row, trades_for(row["address"]), now)))
 
     cap = vol_cap_from([p for _, p in profiles], th.max_vol_percentile)
     for _, p in profiles:

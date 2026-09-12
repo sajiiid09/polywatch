@@ -1,11 +1,15 @@
 """A live book feed, so the exit ladder stops being fifteen seconds coarse.
 
-The asymmetry this exists to fix: entry latency is bounded by data-api's activity cache and
-cannot be engineered away -- a third party's fills can only be polled, because the market
-websocket carries no wallet address and the user websocket reports only your own account. Exit
-latency has no such excuse. The stop-loss, the trailing stop and the time stop are enforced by
-this process, and until now the process looked at them once per poll. In a market that moves in
-seconds, a fifteen-second stop-loss is a fifteen-second option written against us for free.
+The asymmetry this exists to fix: exit latency was always ours to lose. The stop-loss, the
+trailing stop and the time stop are enforced by this process, and until this module the process
+looked at them once per poll. In a market that moves in seconds, a fifteen-second stop-loss is a
+fifteen-second option written against us for free.
+
+Entry latency was assumed to be the other kind of problem -- the market websocket carries no
+wallet address and the user websocket reports only your own account, so a third party's fills
+looked unobservable by any faster means. That held for Polymarket's API and not for the Polygon
+logs underneath it; copytrade/tradestream.py and ADR-0008 have the measurements. This module is
+unchanged by that, and is still the right answer for books.
 
 The CLOB market channel does exactly what is needed here: subscribe with a list of token ids and
 it pushes a `book` snapshot and then `price_change` deltas as they happen. This module keeps
@@ -77,6 +81,12 @@ class BookStream:
         self._thread: threading.Thread | None = None
         self._ws = None
         self._stop = threading.Event()
+        # Set while `watch` is deliberately cycling the socket. Without it the reader thread,
+        # which is blocked in recv() on the descriptor `watch` just closed, reports the
+        # resubscribe as `OSError: Bad file descriptor ... falling back to polling` -- an
+        # alarming line for a thing that is working, and a needless backoff wait before the
+        # reconnect that was the entire point of closing it.
+        self._cycling = threading.Event()
         self.updates = 0
         self.connects = 0
         self.pings = 0
@@ -116,6 +126,7 @@ class BookStream:
         self._tokens |= new
         if self._thread is None:
             return
+        self._cycling.set()
         try:
             if self._ws is not None:
                 self._ws.close()      # the run loop reconnects with the wider subscription
@@ -173,13 +184,22 @@ class BookStream:
             except Exception as e:  # noqa: BLE001 - a dead socket is a fallback, not a crash
                 if self._stop.is_set():
                     return
-                self.log(f"  ~ book stream: {type(e).__name__}: {e}; falling back to polling")
+                if not self._cycling.is_set():
+                    self.log(f"  ~ book stream: {type(e).__name__}: {e}; "
+                             f"falling back to polling")
             finally:
                 try:
                     if self._ws is not None:
                         self._ws.close()
                 except Exception:  # noqa: BLE001
                     pass
+            if self._cycling.is_set():
+                # Our own resubscribe. Reconnect at once rather than backing off: the position
+                # that prompted it is open and unstreamed until we do, and the interval between
+                # book checks is the resolution of its stop-loss.
+                self._cycling.clear()
+                delay = RECONNECT_BASE_S
+                continue
             if self._stop.wait(delay):
                 return
             delay = min(RECONNECT_CAP_S, delay * 2)

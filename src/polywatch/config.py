@@ -72,7 +72,13 @@ LEADERBOARD_PERIODS = ("DAY", "WEEK", "MONTH", "ALL")
 LEADERBOARD_ORDERINGS = ("PNL", "VOL")
 LEADERBOARD_MAX_OFFSET = 1000
 
-ACTIVITY_PAGE = 100           # server max is 500; 100 is plenty for a 1Hz poll
+# Server max, verified 2026-09-12: limit=500 returns 500, limit=600 returns 500. Was 100 on the
+# reasoning that a 1Hz poll never needs more -- true of the common case and irrelevant to the one
+# that costs anything. Every poll passes `start`, so the server returns only what is new and the
+# response is the same handful of rows either way; the limit is a cap, not a fetch size. What it
+# changes is the catch-up after a stall, where the page cap used to mean five round trips and a
+# `truncated` error at 500 events. It now takes one.
+ACTIVITY_PAGE = 500
 POSITIONS_PAGE = 500
 CLOSED_POSITIONS_PAGE = 50    # server caps here whatever we ask for
 
@@ -86,6 +92,12 @@ TICK_SIZES = (0.1, 0.01, 0.001, 0.0001)
 # Bankroll defaults. Deliberately small: the whole point of paper mode is to find out whether
 # a $100 account survives Polymarket's taker fees before any real money is exposed to them.
 DEFAULT_BANKROLL_USD = 100.0
+# Stake per copied trade. Read this against DEFAULT_MAX_DRAWDOWN_PCT rather than against the
+# bankroll: the breaker halts the run at a fixed fraction of the bankroll, so the stake decides
+# how many losing trades the run survives before it stops itself. At $10 on a $100 bankroll the
+# 25% breaker is a handful of bad flips deep, which is thin -- $10 stakes want $250 or more
+# behind them.
+DEFAULT_STAKE_USD = 10.0
 DEFAULT_SLIPPAGE = 0.07
 
 # feeType strings carry the category that `markets.category` never does. Matched by substring,
@@ -96,20 +108,26 @@ FEE_TYPE_CATEGORIES = ("geopolitics", "politics", "economics", "finance", "cultu
 
 # --- Copy-trading engine ------------------------------------------------------------------
 
-# Poll cadence for /activity. 15s, not 1s: data-api caches the activity feed, so polling faster
-# than the cache refreshes buys nothing but rate-limit risk and a bigger ingest_log. Whether
-# that is the right number is not assumed -- every signal stores seen_ts and trader_ts, and
-# `task report` prints the observed distribution of the difference. Tune this from that table,
-# not from this comment.
-POLL_INTERVAL_S = 15.0
+# Poll cadence for /activity. Was 15s on the reasoning that data-api caches the feed, so a
+# faster poll buys nothing but rate-limit risk. The signals table has now been read, as that
+# comment asked: at a 15s poll the observed detection lag (trader's fill -> we saw it) ran
+# 13-23s, median 23s. Set against the copy-lag replay -- which puts the edge half-life of a
+# quick-swing wallet at 51-59s, and copier ROI at +16..+27% at 15s of lag, +8..+11% at 30s and
+# at or below zero by 60s -- a median 23s was spending nearly half the edge on the poll itself.
+# 3s costs 2 requests/second across a six-wallet roster, well inside MAX_RPS, and moves the
+# median toward whatever the cache floor turns out to be. Re-read the table before changing it
+# again; it is the only thing here that is measured rather than argued.
+POLL_INTERVAL_S = 3.0
 POLL_OVERLAP_S = 120        # how far back each poll re-reads, so a slow page cannot drop a fill
 POLL_TIMEOUT_S = 5.0        # a 30s socket timeout inside the loop would freeze the stop-loss
 
-# A quick-flip trader's edge decays in minutes. Copying a fill we noticed four minutes late is
-# not copying them, it is buying whatever they already moved. Signals older than this are
-# skipped and counted -- if most skips are 'stale' the poll interval is wrong, or the trader is
-# too fast to copy at all.
-MAX_SIGNAL_AGE_S = 120
+# A quick-flip trader's edge decays in minutes -- and, measured, faster than that: a 51-59s
+# half-life on the fast wallets. Copying a fill noticed two minutes late is not copying them, it
+# is buying what they already moved, at a price that has already absorbed it. 45s keeps a signal
+# only while more than half its edge is still there. Signals older than this are skipped and
+# counted -- if most skips are 'stale' the poll interval is wrong, or the trader is too fast to
+# copy at all, which for some wallets is the honest answer.
+MAX_SIGNAL_AGE_S = 45
 
 # Session bound. The bot is not meant to run unattended: stop-loss and trailing exits are
 # enforced by this process, so when it is not running they are not enforced either. A run ends
@@ -141,6 +159,14 @@ MAX_ENTRY_PRICE = 0.95
 ENV_PRIVATE_KEY = "POLYMARKET_PRIVATE_KEY"
 ENV_FUNDER = "POLYMARKET_FUNDER"        # the proxy/funder address that holds the USDC
 ENV_API_CREDS = ("POLYMARKET_API_KEY", "POLYMARKET_API_SECRET", "POLYMARKET_API_PASSPHRASE")
+# Opt-in for live trading with no terminal attached. `--yes` alone is a person skipping a
+# confirmation they have already read; `--yes` from cron is money moving with nobody watching,
+# and only the operator can tell the two apart.
+ENV_UNATTENDED = "POLYWATCH_UNATTENDED"
+# Which wallet signs. 1 is the email/magic-login proxy, 2 a browser wallet's proxy, 0 a bare EOA
+# that holds its own USDC. Wrong value means every order is rejected at the signature check.
+ENV_SIGNATURE_TYPE = "POLYMARKET_SIGNATURE_TYPE"
+DEFAULT_SIGNATURE_TYPE = 1
 CLOB_CHAIN_ID = 137                      # Polygon mainnet
 
 # Fee floor. A round trip costs 2 * rate * min(p, 1-p) / p of the stake -- 10% at even odds in
@@ -235,6 +261,66 @@ MIN_ARCHETYPE_POSITIONS = 15
 
 # A skip reason has to be this share of a run's skips before it counts as dominating it.
 SKIP_DOMINANCE_FRAC = 0.35
+
+
+# --- Chain trade stream -----------------------------------------------------------------------
+# Why this exists: data-api /activity ships `cache-control: public, max-age=15`, and the
+# measured feed lag across four real runs was 13-21s against a loop cost of 0.0-0.4s. Verified
+# 2026-09-12 by probe: data-api's `timestamp` for a fill IS the Polygon block timestamp, to the
+# second. The information was on chain the whole time; the wait was the indexer's, not ours.
+#
+# This supersedes the claim in fetch/polymarket.py and ADR-0003 that a third party's fills
+# "cannot be streamed, only polled". That is true of Polymarket's own websockets -- the CLOB
+# market channel carries no wallet address and the user channel reports only your own account.
+# It is not true of the chain, where the maker is an indexed topic and therefore filterable by
+# the node before a byte reaches us.
+
+# Two endpoints, raced. Both verified 2026-09-12 to accept eth_subscribe over WSS and to deliver
+# newHeads at or slightly before the block's own stated timestamp. Free, no key, no signup; the
+# redundancy is because one of them going quiet must not cost a session its speed.
+CHAIN_WSS = ("wss://polygon-bor-rpc.publicnode.com", "wss://polygon.drpc.org")
+
+# Polymarket's exchange contracts on Polygon, as far as we know them. This list is NOT used to
+# filter the subscription, and that is deliberate. Filtering by address is how the first cut
+# silently lost fills: a coverage check against the live feed turned up a third contract,
+# 0xe111180000d2663c0091e4f400237545b87b996b, that no amount of reading the docs would have
+# produced, and there is no reason to think the set is closed now. The roster topic filter is
+# already narrow enough on its own -- a log has to name one of our wallets as maker or taker to
+# reach us at all -- so subscribing by event signature alone catches any contract Polymarket
+# deploys next, at no extra traffic.
+#
+# What the list is for: recognising an address we have not seen before and saying so, rather
+# than trading on it in silence.
+CHAIN_EXCHANGES = ("0xe2222d279d744050d28e00520010520000310f59",   # the bulk of current flow
+                   "0xe111180000d2663c0091e4f400237545b87b996b",   # found by coverage check
+                   "0x4bfb41d5b3570defd03c39a9a4d8de6bd8b8982e",   # legacy CTF exchange
+                   "0xc5d563a36ae78145c45a50134d48a1215220f80a")   # NegRisk; dormant when sampled
+
+# OrderFilled(bytes32 indexed orderHash, address indexed maker, address indexed taker, ...).
+# topic1 is the order hash, topic2 the maker, topic3 the taker; the 224-byte body is
+# (makerAssetId, takerAssetId, makerAmountFilled, takerAmountFilled, fee, _, _).
+CHAIN_ORDER_FILLED_TOPIC = \
+    "0xd543adfd945773f1a62f74f0ee55a5e3b9b1a28262980ba90b1a89f2ea84d8ee"
+
+# Polymarket amounts are USDC-scaled: six decimals, on both legs.
+CHAIN_DECIMALS = 6
+
+# Connect quickly; tolerate silence. A roster of six wallets can go minutes without a fill, and
+# a read timeout applied to that silence would tear down a working socket. As in stream.py, the
+# read timeout is a heartbeat interval rather than a failure.
+CHAIN_CONNECT_TIMEOUT_S = 10.0
+CHAIN_READ_TIMEOUT_S = 30.0
+CHAIN_RECONNECT_BASE_S = 1.0
+CHAIN_RECONNECT_CAP_S = 30.0
+
+# How many (tx_hash, log_index) pairs to remember when deduping the two racing endpoints. One
+# block carries ~16 OrderFilled logs unfiltered and far fewer once maker-filtered, so this is
+# several hundred blocks of memory for a few tens of kilobytes.
+CHAIN_SEEN_CAP = 4096
+
+# Block timestamps, cached from the parallel newHeads subscription so the hot path never has to
+# make an eth_getBlockByNumber round trip to date an event.
+CHAIN_BLOCK_TS_CAP = 512
 
 
 # --- Generated documents ----------------------------------------------------------------------

@@ -244,8 +244,8 @@ class Task:
 # The floor under that is the stop, the trailing stop and the time stop, all of which need this
 # process running. Set --take-profit to get a resting GTC sell instead: it caps the upside, and
 # it is the right trade when the alternative is leaving the position unwatched.
-QUICK_FLIP = dict(hold="quick_flips", max_hold_s=2700, max_signal_age_s=120,
-                  poll_interval_s=15.0, trail_pct=0.06, follow_exit=True,
+QUICK_FLIP = dict(hold="quick_flips", max_hold_s=2700, max_signal_age_s=45,
+                  poll_interval_s=3.0, trail_pct=0.06, follow_exit=True,
                   tp_kind=None, tp_value=None)
 
 # Looser everything: a position meant to be held for hours cannot have a 45-minute time stop or

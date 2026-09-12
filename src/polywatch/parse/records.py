@@ -8,6 +8,12 @@ from ..config import (FEE_EXPONENT_DEFAULT, FEE_FALLBACK, FEE_FALLBACK_DEFAULT,
                       FEE_TYPE_CATEGORIES)
 from .fields import FieldError, iso_ts, json_str, opt, req
 
+# Places to round every amount to. Polymarket quotes USDC and shares to six decimals, and
+# both the /activity path and the chain path must land on the identical float -- see
+# parse_activity.
+AMOUNT_DP = 6
+
+
 
 def parse_leaderboard(payload: list, source: str = "leaderboard") -> list[dict]:
     out = []
@@ -174,6 +180,14 @@ def parse_activity(payload: list) -> list[dict]:
 
     `side` is optional here in a way it never is on /trades: a REDEEM or a MERGE has no side,
     and those rows still matter because they are how a position can vanish without a sell.
+
+    Amounts are rounded to `AMOUNT_DP`. That is not cosmetic. The same fill now reaches the
+    engine by two routes -- this one, which parses Polymarket's decimal string, and the chain
+    decoder, which divides a uint256 by 1e6 -- and `signals` is UNIQUE on
+    (run_id, tx_hash, token_id, side, size) with `size` stored as REAL. A value such as
+    825.09091 can land one ULP apart between those two computations, in which case the UNIQUE
+    constraint does not fire and the run buys the same fill twice. Rounding both paths to the
+    six places the exchange actually quotes in makes them bit-identical.
     """
     out = []
     for rec in payload:
@@ -184,9 +198,9 @@ def parse_activity(payload: list) -> list[dict]:
             "token_id": opt(rec, "asset", str, ctx, ""),
             "condition_id": opt(rec, "conditionId", str, ctx, ""),
             "side": (opt(rec, "side", str, ctx, "") or "").upper(),
-            "size": opt(rec, "size", float, ctx, 0.0),
-            "price": opt(rec, "price", float, ctx, 0.0),
-            "usdc_size": opt(rec, "usdcSize", float, ctx, 0.0),
+            "size": round(opt(rec, "size", float, ctx, 0.0), AMOUNT_DP),
+            "price": round(opt(rec, "price", float, ctx, 0.0), AMOUNT_DP),
+            "usdc_size": round(opt(rec, "usdcSize", float, ctx, 0.0), AMOUNT_DP),
             "ts": req(rec, "timestamp", int, ctx),
             "outcome": opt(rec, "outcome", str, ctx),
             "outcome_index": opt(rec, "outcomeIndex", int, ctx),
