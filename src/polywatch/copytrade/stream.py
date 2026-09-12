@@ -1,11 +1,15 @@
 """A live book feed, so the exit ladder stops being fifteen seconds coarse.
 
-The asymmetry this exists to fix: entry latency is bounded by data-api's activity cache and
-cannot be engineered away -- a third party's fills can only be polled, because the market
-websocket carries no wallet address and the user websocket reports only your own account. Exit
-latency has no such excuse. The stop-loss, the trailing stop and the time stop are enforced by
-this process, and until now the process looked at them once per poll. In a market that moves in
-seconds, a fifteen-second stop-loss is a fifteen-second option written against us for free.
+The asymmetry this exists to fix: exit latency was always ours to lose. The stop-loss, the
+trailing stop and the time stop are enforced by this process, and until this module the process
+looked at them once per poll. In a market that moves in seconds, a fifteen-second stop-loss is a
+fifteen-second option written against us for free.
+
+Entry latency was assumed to be the other kind of problem -- the market websocket carries no
+wallet address and the user websocket reports only your own account, so a third party's fills
+looked unobservable by any faster means. That held for Polymarket's API and not for the Polygon
+logs underneath it; copytrade/tradestream.py and ADR-0008 have the measurements. This module is
+unchanged by that, and is still the right answer for books.
 
 The CLOB market channel does exactly what is needed here: subscribe with a list of token ids and
 it pushes a `book` snapshot and then `price_change` deltas as they happen. This module keeps

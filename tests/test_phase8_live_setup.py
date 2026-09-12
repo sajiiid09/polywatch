@@ -120,6 +120,143 @@ def test_reading_no_account_at_all_is_an_error_not_an_empty_report(clean_env):
         account.resolve_address(None)
 
 
+# --- roster filters: the kind of trader, not the quality of one ----------------------------
+
+def _seed(con, addr, archetype, hold_s, rank):
+    store.upsert_trader_score(con, {"address": addr, "rank_score": rank, "n_closed": 50})
+    store.upsert_trader_strategy(con, {"address": addr, "archetype": archetype,
+                                       "hold_p50_s": hold_s, "confidence": 1.0,
+                                       "evidence_n": 50})
+
+
+@pytest.fixture
+def scored(tmp_path):
+    con = store.connect(tmp_path / "s.db")
+    store.init_db(con)
+    _seed(con, "0xfast", "scalper", 120, 0.9)
+    _seed(con, "0xslow", "resolution-holder", 5 * 86400, 0.95)
+    _seed(con, "0xmid", "momentum-chaser", 4 * 3600, 0.8)
+    return con
+
+
+def test_the_shortlist_is_unfiltered_by_default(scored):
+    assert len(store.top_trader_scores(scored, limit=10)) == 3
+
+
+def test_an_archetype_filter_keeps_only_that_kind(scored):
+    rows = store.top_trader_scores(scored, limit=10, archetypes=["scalper", "momentum-chaser"])
+    assert {r["address"] for r in rows} == {"0xfast", "0xmid"}
+
+
+def test_the_highest_ranked_wallet_is_dropped_when_it_is_the_wrong_kind(scored):
+    # 0xslow ranks highest. A roster built for flips must not take it anyway.
+    rows = store.top_trader_scores(scored, limit=10, archetypes=["scalper"])
+    assert [r["address"] for r in rows] == ["0xfast"]
+
+
+def test_a_hold_ceiling_drops_wallets_too_slow_to_produce_flips(scored):
+    rows = store.top_trader_scores(scored, limit=10, max_hold_s=3600)
+    assert [r["address"] for r in rows] == ["0xfast"]
+
+
+def test_the_two_filters_compose(scored):
+    assert store.top_trader_scores(scored, limit=10, archetypes=["momentum-chaser"],
+                                   max_hold_s=3600) == []
+
+
+def test_an_unclassified_wallet_is_dropped_by_a_filter_rather_than_passed_through(scored):
+    store.upsert_trader_score(scored, {"address": "0xunknown", "rank_score": 0.99,
+                                       "n_closed": 50})
+    assert "0xunknown" not in {r["address"]
+                               for r in store.top_trader_scores(scored, limit=10,
+                                                                archetypes=["scalper"])}
+    assert "0xunknown" in {r["address"] for r in store.top_trader_scores(scored, limit=10)}
+
+
+# --- deleting a task ------------------------------------------------------------------------
+
+def test_a_task_with_runs_behind_it_is_not_deletable(tmp_path):
+    con = store.connect(tmp_path / "d.db")
+    store.init_db(con)
+    store.upsert_task(con, Task(name="hasrun", trader="0xa").as_row())
+    store.start_run(con, "hasrun", "paper", 100.0)
+    with pytest.raises(ValueError):
+        store.delete_task(con, "hasrun")
+
+
+def test_deleting_a_task_takes_its_roster_with_it(tmp_path):
+    con = store.connect(tmp_path / "d2.db")
+    store.init_db(con)
+    store.upsert_task(con, Task(name="fresh", trader="0xa").as_row())
+    store.set_task_traders(con, "fresh", [{"address": "0xa"}])
+    assert store.delete_task(con, "fresh") == 1
+    assert con.execute("SELECT COUNT(*) FROM task_traders WHERE task='fresh'").fetchone()[0] == 0
+
+
+# --- cost basis: what a closed trade can still say about itself ---------------------------
+
+@pytest.fixture
+def run(tmp_path):
+    con = store.connect(tmp_path / "c.db")
+    store.init_db(con)
+    store.upsert_task(con, Task(name="t", trader="0xa").as_row())
+    return con, store.start_run(con, "t", "paper", 100.0)
+
+
+def _pos(con, run_id, shares=10.0, cost=8.0, fee=0.2):
+    return store.open_position(con, {"run_id": run_id, "trader": "0xa", "token_id": "tok",
+                                     "condition_id": "c", "shares": shares, "avg_price": cost / shares,
+                                     "cost_usd": cost, "fees_paid": fee,
+                                     "opened_ts": 1_700_000_000})
+
+
+def _pos_row(con, pid):
+    return con.execute("SELECT * FROM positions WHERE id=?", (pid,)).fetchone()
+
+
+def test_a_new_position_records_what_it_cost(run):
+    con, rid = run
+    assert _pos_row(con, _pos(con, rid))["cost_basis"] == 8.0
+
+
+def test_adding_to_a_position_adds_to_its_cost_basis(run):
+    con, rid = run
+    pid = _pos(con, rid)
+    store.add_to_position(con, pid, shares=5.0, cost_usd=4.0, fee=0.1)
+    r = _pos_row(con, pid)
+    assert r["cost_basis"] == 12.0
+    assert r["cost_usd"] == 12.0
+
+
+def test_closing_a_position_clears_what_is_tied_up_but_not_what_it_cost(run):
+    con, rid = run
+    pid = _pos(con, rid)
+    store.close_position(con, pid, proceeds_usd=9.0, exit_fee=0.2, reason="tp")
+    r = _pos_row(con, pid)
+    assert r["cost_usd"] == 0.0, "money is no longer tied up"
+    assert r["cost_basis"] == 8.0, "but the trade still knows what it cost"
+
+
+def test_a_closed_trade_can_be_scored_as_roi(run):
+    con, rid = run
+    pid = _pos(con, rid)
+    store.close_position(con, pid, proceeds_usd=10.0, exit_fee=0.2, reason="tp")
+    r = _pos_row(con, pid)
+    # (10.0 - 8.0 - 0.2 - 0.2) / 8.0 -- computable only because cost_basis survived
+    assert abs(r["realized_pnl"] / r["cost_basis"] - 0.2) < 1e-9
+
+
+def test_a_partial_sale_leaves_the_whole_entry_cost_on_the_trade(run):
+    con, rid = run
+    pid = _pos(con, rid)
+    store.settle_position(con, pid, shares_sold=5.0, proceeds_usd=4.5, exit_fee=0.1,
+                          reason="partial")
+    r = _pos_row(con, pid)
+    assert r["open"] == 1
+    assert r["cost_usd"] == 4.0, "half the money is still tied up"
+    assert r["cost_basis"] == 8.0, "the trade still cost what it cost"
+
+
 # --- the unattended guard -------------------------------------------------------------------
 
 @pytest.fixture

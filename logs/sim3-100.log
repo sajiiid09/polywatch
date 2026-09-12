@@ -1,0 +1,38 @@
+run 81  task sim3-100  mode PAPER
+  traders       2, up to $50.00 each
+                0x3f3aa7005f8006bfcc367d43a25cde25509fe8fd
+                0x6268011cdc123d7ab44cabdef70b7a571f286031
+  bankroll      $100.00   stake fixed $5.00   max/market $25.00
+  poll          15s   signals older than 120s are skipped as stale
+  session       8.0h, then flatten
+  stop-loss     -15% off entry   take-profit none -- exits follow the trader, the trail and the stop
+  trailing      6%   max hold 45m   follow trader's exits: yes
+  breakers      -$20.00 or -25%
+
+  exits         checked on every book update (streamed)
+
+  The stop-loss is enforced by this process. The exchange has no stop order type,
+  so while the bot is not running, the stop is not running. The take-profit, if it
+  is a resting order, does not depend on the bot at all.
+
+  stopping after this tick (again to force)
+
+run 81  task sim3-100  PAPER
+  started        2026-09-09 17:48   stopped 2026-09-09 18:10   (stopped)
+  bankroll       $100.00 -> $100.00
+  realized pnl   $+0.00   fees $0.00
+  signals        4 seen, 0 copied, 4 skipped
+  positions      0 closed, 0 still open
+  latency        n=4  p50 23s  p90 23s  p99 23s  max 23s  (poll 15s)
+                 of which  feed 20.5s  loop 0.0s  on average
+                 the feed is the bottleneck, not the loop -- a shorter poll interval will not help
+  why trades were skipped
+    not_held        3
+    market_closing  1
+  by trader
+    wallet         signals copied  pos  open       pnl    fees
+    0x3f3aa7005f80       1      0    0     0     +0.00    0.00
+    0x6268011cdc12       3      0    0     0     +0.00    0.00
+
+  session recorded. next steps:
+    1. Nothing outstanding. Run `polywatch strategy learn` to fold this session into the record, then start the next run.

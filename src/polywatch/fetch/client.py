@@ -37,12 +37,21 @@ class RateLimiter:
         self._lock = threading.Lock()
 
     def wait(self) -> None:
+        """Reserve the next slot, then sleep until it -- outside the lock.
+
+        The sleep used to happen while holding the lock, which made this a good deal more than a
+        rate limit: a thread waiting out its 100ms also blocked every other thread from so much
+        as reading the clock, so the parallel book fetches ran effectively single-file and each
+        one paid the full interval in series. Reserving a slot under the lock and sleeping to it
+        outside keeps the global rate exactly as it was while letting N threads wait out their N
+        staggered slots concurrently.
+        """
         with self._lock:
-            now = time.monotonic()
-            gap = self.min_interval - (now - self._last)
-            if gap > 0:
-                time.sleep(gap)
-            self._last = time.monotonic()
+            target = max(time.monotonic(), self._last + self.min_interval)
+            self._last = target
+        gap = target - time.monotonic()
+        if gap > 0:
+            time.sleep(gap)
 
 
 class Client:

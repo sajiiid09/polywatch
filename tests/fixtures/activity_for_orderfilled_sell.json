@@ -1,0 +1,25 @@
+[
+  {
+    "proxyWallet": "0x3e9ff2dbf2a6356ee47049e9f3c43a70cb55d57f",
+    "timestamp": 1789173334,
+    "conditionId": "0xefa17dee3af09f69f9ddf245b969aa4efbe7c71cdf06ee49d694408bc33e2ed2",
+    "type": "TRADE",
+    "size": 5,
+    "usdcSize": 0.01,
+    "transactionHash": "0xebd6c427591de254eac23e17cc23b7eef173b51fae1b265138ae5d2ef1009b7a",
+    "price": 0.002,
+    "asset": "33339798372916037220786136133406478491116150628220441951753426683441228279665",
+    "side": "SELL",
+    "outcomeIndex": 0,
+    "title": "Will Shakhtar Donetsk win the 2026-27 UEFA Champions League Championship?",
+    "slug": "will-shakhtar-donetsk-win-the-2026-27-uefa-champions-league-championship-20260701202025578",
+    "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/uefa-champions-league-2025-26-which-teams-qualify-StbSIjaEx2St.png",
+    "eventSlug": "uefa-champions-league-2027-champion-20260701202025549",
+    "outcome": "Yes",
+    "name": "vtcchampion53",
+    "pseudonym": "Dismal-Gopher",
+    "bio": "Yes they will.",
+    "profileImage": "",
+    "profileImageOptimized": ""
+  }
+]

@@ -1,0 +1,25 @@
+[
+  {
+    "proxyWallet": "0x67ac9e1ad7d7e74ef0215d14fc8edb538e4fedf1",
+    "timestamp": 1789160248,
+    "conditionId": "0x8a045ab5bd960b812f7a8efc15ae54d37502ceefe577cdc4b3f72687c839b82e",
+    "type": "TRADE",
+    "size": 952.75,
+    "usdcSize": 876.53,
+    "transactionHash": "0x457b6e0b305f81cff2737f90116b6076acd1edf1507b3ce23f537b0b522edc59",
+    "price": 0.92,
+    "asset": "98137879301482368215292703416000252576975257052939310485686273073195455828130",
+    "side": "BUY",
+    "outcomeIndex": 0,
+    "title": "Will Sevilla FC win on 2026-09-11?",
+    "slug": "lal-sev-val-2026-09-11-sev",
+    "icon": "https://polymarket-upload.s3.us-east-2.amazonaws.com/league-lal.png",
+    "eventSlug": "lal-sev-val-2026-09-11",
+    "outcome": "Yes",
+    "name": "fkcvffcjt",
+    "pseudonym": "Sparse-Outset",
+    "bio": "",
+    "profileImage": "https://polymarket-upload.s3.us-east-2.amazonaws.com/profile-image-2859653-608edd41-481c-43c7-b087-b2f9ab9c18a8.png",
+    "profileImageOptimized": ""
+  }
+]

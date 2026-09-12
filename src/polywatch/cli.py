@@ -19,7 +19,8 @@ import sys
 from datetime import datetime, timezone
 
 from . import ingest
-from .config import DB_PATH, DEFAULT_BANKROLL_USD, ENV_FUNDER, MAX_RPS
+from .config import (DB_PATH, DEFAULT_BANKROLL_USD, DEFAULT_STAKE_USD, ENV_FUNDER,
+                     MAX_RPS)
 from .copytrade import task as task_mod
 from .db import store
 from .screen import Thresholds, screen as run_screen
@@ -104,6 +105,13 @@ def main(argv=None) -> int:
                          "inferred from holding period rather than measured")
     dc.add_argument("--include-excluded", action="store_true",
                     help="also show wallets that failed a hard gate, and why")
+    dc.add_argument("--archetype", action="append", default=None,
+                    help="only wallets classified as this; repeat for several. "
+                         "scalper, momentum-chaser, event-specialist and fade-the-move "
+                         "are the quick-swing kinds; resolution-holder is not")
+    dc.add_argument("--max-hold-hours", type=float, default=None,
+                    help="only wallets whose median hold is under this, whatever they "
+                         "are labelled -- a slow wallet produces no flips to copy")
     dc.add_argument("--rps", type=float, default=MAX_RPS)
     dc.add_argument("--json", action="store_true")
     for name, default, helptext in _THRESHOLD_FLAGS:
@@ -144,6 +152,14 @@ def main(argv=None) -> int:
                          "them; excluded wallets are never chosen")
     tc.add_argument("--min-rank-score", type=float, default=None,
                     help="floor on rank_score when building a roster from the shortlist")
+    tc.add_argument("--archetype", action="append", default=None,
+                    help="only wallets classified as this; repeat for several. "
+                         "scalper, momentum-chaser, event-specialist and fade-the-move "
+                         "are the quick-swing kinds; resolution-holder is not")
+    tc.add_argument("--max-hold-hours", type=float, default=None,
+                    help="only wallets whose median hold is under this, whatever they "
+                         "are labelled -- a slow wallet produces no flips to copy")
+
     tc.add_argument("--per-trader-usd", type=float, default=None,
                     help="cap on what one trader's signals may have at risk; defaults to an "
                          "equal share of the bankroll")
@@ -153,7 +169,8 @@ def main(argv=None) -> int:
                     help="quick_flips is what the poller is tuned for; hours loosens the "
                          "exits for an idea you intend to babysit yourself")
     tc.add_argument("--bankroll", type=float, default=DEFAULT_BANKROLL_USD)
-    tc.add_argument("--stake", type=float, default=10.0, help="USD per copied trade (fixed)")
+    tc.add_argument("--stake", type=float, default=DEFAULT_STAKE_USD,
+                    help="USD per copied trade (fixed)")
     tc.add_argument("--mirror", action="store_true",
                     help="size as a fraction of their account instead of a fixed stake")
     tc.add_argument("--max-market-usd", type=float, default=None)
@@ -208,6 +225,13 @@ def main(argv=None) -> int:
                           "optional `stream` extra")
     trn.add_argument("--no-stream", action="store_true",
                      help="poll for books even when streaming is available")
+    trn.add_argument("--chain", action="store_true",
+                     help="detect the copied wallets' fills from Polygon rather than waiting "
+                          "for data-api to index them; measured at 13-21s of the copy latency, "
+                          "against 0.0-0.4s for the loop itself. On by default; needs the "
+                          "optional `stream` extra")
+    trn.add_argument("--no-chain", action="store_true",
+                     help="detect fills only from the /activity poll, at its ~15s cache floor")
     # A run ends by recording what it did and what is left for whoever is next. On by default:
     # the sessions worth handing over are the ones nobody remembered to log.
     trn.add_argument("--no-session-log", action="store_true",
@@ -334,8 +358,10 @@ def main(argv=None) -> int:
                      with_replay=not args.no_replay,
                      categories=[c.upper() for c in args.category] if args.category else None,
                      thresholds=_thresholds(args), max_candidates=args.candidates)
-        rows = store.top_trader_scores(con, limit=args.limit,
-                                       include_excluded=args.include_excluded)
+        rows = store.top_trader_scores(
+            con, limit=args.limit, include_excluded=args.include_excluded,
+            archetypes=args.archetype,
+            max_hold_s=int(args.max_hold_hours * 3600) if args.max_hold_hours else None)
         if args.json:
             print(json.dumps([dict(r) for r in rows], indent=2))
             return 0

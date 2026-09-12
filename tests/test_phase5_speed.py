@@ -1,7 +1,8 @@
 """Phase 5: how often the exits are actually checked, and what a tick costs.
 
-Entry latency is bounded by data-api's activity cache and cannot be engineered away. Exit
-latency has no such excuse -- the stop-loss, the trailing stop and the time stop are enforced by
+Entry latency was assumed bounded by data-api's activity cache -- see test_phase9_chain_stream
+for where that turned out to be a fact about Polymarket's API rather than about the world. Exit
+latency never had that excuse -- the stop-loss, the trailing stop and the time stop are enforced by
 this process and by nothing else, so the interval between checks is the resolution of every
 protection a run has.
 """

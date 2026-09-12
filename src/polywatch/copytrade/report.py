@@ -18,16 +18,24 @@ def _dt(ts: int | None) -> str:
     return "-" if not ts else datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M")
 
 
-def latency_block(stats: dict, poll_interval_s: float, split: dict | None = None) -> list[str]:
+def latency_block(stats: dict, poll_interval_s: float, split: dict | None = None,
+                  by_source: list | None = None) -> list[str]:
     """Measured copy latency: seen_ts - trader_ts, per signal.
 
     Read against the poll interval. If p90 exceeds the staleness gate, most of what this trader
     does is uncopyable at this cadence whatever the median says.
 
-    The split is the actionable half. `feed` is how stale data-api's answer already was when it
-    reached us, which polling faster cannot fix and which is a fact about the trader's
-    copyability rather than about this program. `loop` is ours, and is the only part worth
-    tuning `POLL_INTERVAL_S` against.
+    The split is the actionable half. `feed` is how stale the answer already was when it reached
+    us; `loop` is ours, and is the only part worth tuning `POLL_INTERVAL_S` against.
+
+    `by_source` breaks the same figure out by detection route, and reading it matters more than
+    reading the headline. The two routes have different floors -- the /activity poll's is
+    data-api's fifteen-second cache, the chain stream's is a block -- so the blended median
+    moves with the mix between them as much as with either getting faster. A run where the
+    chain line covers most of the signals and sits at a second or two is the run this was built
+    for; one where `activity` still dominates means the chain feed is not connecting, or the
+    token index is missing the markets the roster trades (look for `token_unresolved` in the
+    skip histogram).
     """
     if not stats.get("n"):
         return ["  latency        no signals observed"]
@@ -39,6 +47,9 @@ def latency_block(stats: dict, poll_interval_s: float, split: dict | None = None
         if split["feed"] > split["loop"] * 2 and split["feed"] > 2:
             out.append("                 the feed is the bottleneck, not the loop -- a shorter "
                        "poll interval will not help")
+    for src, n, mean in (by_source or []):
+        label = {"chain": "chain (polygon)", "activity": "activity (data-api)"}.get(src, src)
+        out.append(f"                 {label:<22} n={n:<5} {mean:.1f}s behind on average")
     return out
 
 
@@ -65,7 +76,8 @@ def run_report(con, run_id: int, task=None) -> str:
         f"  positions      {s['positions_closed']} closed, {s['positions_open']} still open",
     ]
     lines += latency_block(store.latency_stats(con, run_id), poll,
-                           store.latency_split(con, run_id))
+                           store.latency_split(con, run_id),
+                           store.latency_by_source(con, run_id))
 
     if s["realized_pnl"] and s["fees_paid"]:
         gross = s["realized_pnl"] + s["fees_paid"]

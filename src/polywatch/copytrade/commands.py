@@ -16,7 +16,7 @@ from ..config import (DEFAULT_SIGNATURE_TYPE, ENV_FUNDER, ENV_PRIVATE_KEY, ENV_S
 from ..db import store
 from ..fetch.client import Client
 from . import book as bk
-from . import execution, learn, report, session, stream
+from . import execution, learn, report, session, stream, tradestream
 from . import discover, strategy as strategy_mod
 from .engine import Engine, ReconcileError
 from .task import PRESETS, Task, preset
@@ -42,7 +42,10 @@ def _roster(con, args) -> list[str]:
     n = getattr(args, "from_shortlist", None)
     if n:
         floor = args.min_rank_score or 0.0
-        rows = store.top_trader_scores(con, limit=n * 3)
+        hold = getattr(args, "max_hold_hours", None)
+        rows = store.top_trader_scores(
+            con, limit=n * 3, archetypes=getattr(args, "archetype", None),
+            max_hold_s=int(hold * 3600) if hold else None)
         picked = [r["address"] for r in rows if (r["rank_score"] or 0.0) >= floor][:n]
         if not picked:
             raise SystemExit(
@@ -142,7 +145,26 @@ def _describe(t: Task) -> str:
         f"{t.max_signal_age_s}s",
         f"  session       {t.session_hours:.1f}h; breakers -${t.max_daily_loss_usd:,.2f} "
         f"or -{t.max_drawdown_pct:.0%}",
+        _breaker_depth(t),
     ] if x)
+
+
+def _breaker_depth(t: Task) -> str:
+    """How many stakes deep the drawdown breaker is, and a warning when that is not many.
+
+    The breaker is a fraction of the bankroll and the stake is a fixed number of dollars, so the
+    two together decide how many losing trades a run survives before it halts itself. Raising
+    the stake without raising the bankroll does not make the run bolder -- it makes it shorter,
+    and a run that halts early never reaches the winners that pay for the losers.
+    """
+    if t.buy_method != "fixed" or not t.fixed_usd:
+        return ""
+    room = min(t.max_daily_loss_usd, t.bankroll * t.max_drawdown_pct)
+    n = room / t.fixed_usd
+    line = (f"  breaker depth ${room:,.2f} of room = {n:.1f} stakes at ${t.fixed_usd:,.2f}")
+    if n < 5:
+        line += f"\n                THIN -- a bad run halts before the strategy gets a sample"
+    return line
 
 
 def _list(con, args) -> int:
@@ -172,7 +194,11 @@ def _show(con, args) -> int:
 
 
 def _rm(con, args) -> int:
-    print(f"deleted {store.delete_task(con, args.name)} task(s)")
+    try:
+        print(f"deleted {store.delete_task(con, args.name)} task(s)")
+    except ValueError as e:
+        print(e)
+        return 1
     return 0
 
 
@@ -255,6 +281,26 @@ def _run(con, args) -> int:
                   "uv pip install 'polywatch[stream]'")
 
     eng = Engine(con, t, ex, client, stream=feed)
+
+    # The chain feed. Started after the engine exists because it needs the engine's local
+    # token->market index to resolve a fill, and started before the run so that a fill taken
+    # during startup is already queued by the time the first tick drains it.
+    chain = None
+    if not args.no_chain:
+        # No resolver is handed to the stream: resolving reads the database, the stream runs on
+        # socket threads, and a sqlite3 connection belongs to the thread that opened it. The
+        # engine already holds that line for its book workers. Fills therefore arrive with an
+        # empty condition_id and `drain_trades` resolves them on the engine's own thread.
+        chain = tradestream.connect(t.traders, log=print)
+        if chain is None and chain_requested(args):
+            print("  chain streaming needs the optional extra: "
+                  "uv pip install 'polywatch[stream]'")
+        elif chain is not None:
+            print(f"  chain feed: watching {len(t.traders)} wallet(s) on "
+                  f"{len(tradestream.CHAIN_WSS)} endpoints; /activity still polling as backup")
+    eng.trades = chain
+    eng.warm_assets()
+
     try:
         summary = eng.run()
     except ReconcileError as e:
@@ -272,6 +318,8 @@ def _run(con, args) -> int:
     finally:
         if feed is not None:
             feed.stop()
+        if chain is not None:
+            chain.stop()
     print()
     print(report.run_report(con, summary["run_id"], t))
     _close_session(con, t.name, summary["run_id"], args)
@@ -415,6 +463,11 @@ def _session_log(con, args) -> int:
 def stream_requested(args) -> bool:
     """Did the operator ask for streaming explicitly? Only then is its absence worth a line."""
     return bool(getattr(args, "stream", False))
+
+
+def chain_requested(args) -> bool:
+    """Did the operator ask for the chain feed explicitly?"""
+    return bool(getattr(args, "chain", False))
 
 
 def _report(con, args) -> int:
